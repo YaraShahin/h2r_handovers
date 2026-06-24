@@ -1,0 +1,13 @@
+repositories:
+  franka_ros2:
+    type: git
+    url: https://github.com/boschresearch/franka_ros2.git
+    version: fer1
+  ./../../../vision_libs/EgoHOS:
+    type: git
+    url: https://github.com/YaraShahin/EgoHOS.git
+    version: main
+  ./../../../vision_libs/graspnet-baseline:
+    type: git
+    url: https://github.com/YaraShahin/graspnet-baseline.git
+    version: main

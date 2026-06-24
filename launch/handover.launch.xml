@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<launch>
+  <include file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">
+    <arg name="camera_name"      value="camera"/>
+    <arg name="camera_namespace" value="camera"/>
+
+    <arg name="enable_color" value="true"/>
+    <arg name="enable_depth" value="true"/>
+
+    <arg name="rgb_camera.color_profile"   value="640,480,30"/>
+    <arg name="depth_module.depth_profile" value="640,480,30"/>
+
+    <arg name="align_depth.enable" value="true"/>
+    <arg name="pointcloud.enable"  value="true"/>
+
+    <arg name="enable_infra1" value="false"/>
+    <arg name="enable_infra2" value="false"/>
+  </include>
+
+  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen"
+        args="-d $(find-pkg-share h2r_handovers)/config/config.rviz"/>
+
+  <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/>
+</launch>
