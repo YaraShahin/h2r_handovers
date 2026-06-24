@@ -26,20 +26,17 @@ class HandStabilizationNode(Node):
         self.declare_parameter('status_topic', 'hand_stability_status')
         self.declare_parameter('hand_label', HAND_LABEL)
         self.declare_parameter('min_hand_pixels', 50)
-        self.declare_parameter('window_duration', 1.0)
-        self.declare_parameter('position_tolerance_px', 2000000000000.0)
+        self.declare_parameter('position_tolerance_px', 10.0)
         self.declare_parameter('min_samples', 5)
 
         self._hand_label = self.get_parameter('hand_label').value
         self._min_hand_pixels = self.get_parameter('min_hand_pixels').value
-        self._window_duration = self.get_parameter('window_duration').value
         self._position_tolerance_px = self.get_parameter('position_tolerance_px').value
         self._min_samples = self.get_parameter('min_samples').value
 
         self._bridge = CvBridge()
-        self._history = deque()  # entries: (stamp_sec, (cx, cy))
+        self._history = deque(maxlen=self._min_samples)  # entries: (cx, cy)
         self._last_status = None
-        self._tracking_start = None
 
         mask_topic = self.get_parameter('mask_topic').value
         status_topic = self.get_parameter('status_topic').value
@@ -50,14 +47,11 @@ class HandStabilizationNode(Node):
         self.get_logger().info(
             f"Tracking hand label {self._hand_label} on '{mask_topic}', "
             f"publishing status on '{status_topic}' "
-            f"(tolerance={self._position_tolerance_px}px over {self._window_duration}s)"
+            f"(tolerance={self._position_tolerance_px}px over {self._min_samples} samples)"
         )
 
     def _mask_callback(self, msg: Image) -> None:
         mask = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        if stamp == 0.0:
-            stamp = self.get_clock().now().nanoseconds * 1e-9
 
         ys, xs = np.nonzero(mask == self._hand_label)
 
@@ -65,32 +59,19 @@ class HandStabilizationNode(Node):
             # Hand lost: stale history would otherwise be stitched to a
             # reappearance at a different location, so drop it.
             self._history.clear()
-            self._tracking_start = None
             self._publish_status(STATUS_NO_HAND)
             return
 
-        if self._tracking_start is None:
-            self._tracking_start = stamp
-
         centroid = (float(xs.mean()), float(ys.mean()))
-        self._history.append((stamp, centroid))
-        self._trim_history(stamp)
+        self._history.append(centroid)
 
-        self._publish_status(self._evaluate_stability(stamp))
+        self._publish_status(self._evaluate_stability())
 
-    def _trim_history(self, now: float) -> None:
-        while self._history and now - self._history[0][0] > self._window_duration:
-            self._history.popleft()
-
-    def _evaluate_stability(self, now: float) -> str:
+    def _evaluate_stability(self) -> str:
         if len(self._history) < self._min_samples:
             return STATUS_UNSTABLE
 
-        if now - self._tracking_start < self._window_duration:
-            # Not enough elapsed time covered yet to judge stability.
-            return STATUS_UNSTABLE
-
-        positions = np.array([pos for _, pos in self._history])
+        positions = np.array(self._history)
         mean_pos = positions.mean(axis=0)
         max_dist = float(np.linalg.norm(positions - mean_pos, axis=1).max())
 
