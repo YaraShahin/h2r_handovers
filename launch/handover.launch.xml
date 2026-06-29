@@ -21,4 +21,18 @@
         args="-d $(find-pkg-share h2r_handovers)/config/config.rviz"/>
 
   <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/>
+
+  <node pkg="h2r_handovers" exec="grasp_selection_node" name="grasp_selection_node" output="screen">
+    <param from="$(find-pkg-share h2r_handovers)/config/handover_params.yaml" />
+  </node>
+
+  <node pkg="h2r_handovers" exec="handover_orchestrator" name="handover_orchestrator" output="screen">
+    <param from="$(find-pkg-share h2r_handovers)/config/handover_params.yaml" />
+  </node>
+
+  <!-- Camera Calibration Static TFs (from panda_hand to camera_link) -->
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="hand_to_cameraTemp" 
+        args="0.07085917397 0.03292617131 0.05131155109 -0.00814520629 0.0006262179598 -0.7175730906 0.6964352971 panda_hand camera_link_temp" />
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="cameraTemp_to_camera" 
+        args="0.015 0.001 0 0.5 -0.5 0.5 0.5 camera_link_temp camera_link" />
 </launch>

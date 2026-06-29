@@ -1,0 +1,61 @@
+#  Grasp Selection
+grasp_selection_node:
+  ros__parameters:
+    input_topic: "grasp_candidates"
+    output_topic: "selected_grasp"
+    # Available policies: highest_score, nearest_depth, ergonomic (placeholder)
+    policy: "highest_score"
+
+#  Handover Orchestrator
+handover_orchestrator:
+  ros__parameters:
+    selected_grasp_topic: "selected_grasp"
+    # MoveIt / Arm
+    planning_group: "panda_arm"
+    planning_frame: "panda_link0"
+    ee_link: "panda_hand"
+    max_velocity_scaling: 0.2
+    max_acceleration_scaling: 0.1
+    planning_time: 5.0
+
+    # Gripper
+    gripper_open_width: 0.08          # metres — fully open
+    gripper_open_speed: 0.1           # m/s
+    grasp_width: 0.0                  # metres — how far to close
+    grasp_speed: 0.03                 # m/s — closing speed
+    grasp_force: 40.0                 # Newtons — grasping force
+    grasp_epsilon_inner: 0.005        # metres — inner tolerance
+    grasp_epsilon_outer: 0.005        # metres — outer tolerance
+
+    # Predefined joint configurations (7-DOF, radians)
+    # HOME: safe resting pose — arm is tucked and out of the way,
+    #        ready to start a new handover.
+    home_joints:
+      - 0.056       # panda_joint1
+      - -0.504      # panda_joint2
+      - 0.012       # panda_joint3
+      - -1.992      # panda_joint4
+      - -0.017      # panda_joint5
+      - 1.535       # panda_joint6
+      - 0.813       # panda_joint7
+
+    # DROPOFF: where the robot moves to place the received object.
+    dropoff_joints:
+      - -0.136
+      - -0.914
+      - 1.049
+      - -2.497
+      - 0.806
+      - 1.853
+      - 1.176
+
+    # Approach
+    # Offset applied along the planning-frame Z axis (upward) to the raw
+    # grasp point, so the arm approaches slightly above.
+    approach_offset_z: 0.08
+
+    # Release detection
+    # 'timeout' — wait a fixed duration before retreating (works now)
+    # 'force'   — monitor Panda F/T sensor until human releases (TODO)
+    release_detection_mode: "timeout"
+    release_timeout_sec: 3.0

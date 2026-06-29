@@ -11,7 +11,10 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/handover.launch.xml']),
-        ('share/' + package_name + '/config', ['config/config.rviz']),
+        ('share/' + package_name + '/config', [
+            'config/config.rviz',
+            'config/handover_params.yaml',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'hand_stabilization_node = h2r_handovers.hand_stabilization_node:main',
+            'grasp_selection_node = h2r_handovers.grasp_selection_node:main',
+            'handover_orchestrator = h2r_handovers.handover_orchestrator:main',
         ],
     },
 )
