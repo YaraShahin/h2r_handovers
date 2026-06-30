@@ -35,6 +35,14 @@ from moveit_msgs.msg import (
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from shape_msgs.msg import SolidPrimitive
+from threading import Event
+
+def _wait_future(future):
+    event = Event()
+    future.add_done_callback(lambda f: event.set())
+    event.wait()
+    return future.result()
+
 
 
 
@@ -158,7 +166,7 @@ class ArmClient:
 
         self._node.get_logger().info(f'ArmClient: sending {label} goal…')
         future = self._client.send_goal_async(goal)
-        goal_handle = future.result()
+        goal_handle = _wait_future(future)
 
         if not goal_handle.accepted:
             self._node.get_logger().error(f'ArmClient: {label} goal REJECTED')
@@ -168,7 +176,7 @@ class ArmClient:
 
         # Wait for result
         result_future = goal_handle.get_result_async()
-        result = result_future.result()
+        result = _wait_future(result_future)
 
         if result.result.error_code.val == MoveItErrorCodes.SUCCESS:
             self._node.get_logger().info(f'ArmClient: {label} succeeded')
@@ -228,14 +236,14 @@ class GripperClient:
     def _send(self, client: ActionClient, goal, label: str) -> bool:
         self._node.get_logger().info(f'GripperClient: sending {label} goal…')
         future = client.send_goal_async(goal)
-        goal_handle = future.result()
+        goal_handle = _wait_future(future)
 
         if not goal_handle.accepted:
             self._node.get_logger().error(f'GripperClient: {label} goal REJECTED')
             return False
 
         result_future = goal_handle.get_result_async()
-        result = result_future.result()
+        result = _wait_future(result_future)
 
         if result.result.success:
             self._node.get_logger().info(f'GripperClient: {label} succeeded')

@@ -16,6 +16,7 @@ from __future__ import annotations
 import enum
 
 import rclpy
+import copy
 from geometry_msgs.msg import PoseStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -62,20 +63,24 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('grasp_width', 0.0)
         self.declare_parameter('grasp_speed', 0.03)
         self.declare_parameter('grasp_force', 40.0)
-        self.declare_parameter('grasp_epsilon_inner', 0.005)
-        self.declare_parameter('grasp_epsilon_outer', 0.005)
+        self.declare_parameter('grasp_epsilon_inner', 0.1)
+        self.declare_parameter('grasp_epsilon_outer', 0.1)
 
         # Predefined joint configurations
         # HOME — safe resting pose, arm tucked and out of the way
         self.declare_parameter('home_joints', [
-            0.056, -0.504, 0.012, -1.992, -0.017, 1.535, 0.813])
+            -0.3017, -0.9131, -1.1905, -1.7694, -0.8113, 1.4376, 0.8624])
         # DROPOFF — where the robot places the received object
         self.declare_parameter('dropoff_joints', [
-            -0.136, -0.914, 1.049, -2.497, 0.806, 1.853, 1.176])
+            0.0761, 0.0087, 0.0108, -2.7316, -0.0448, 2.7889, 0.8629])
 
         # Grasp pose offset — applied along the robot's Z axis (upward)
         # to approach slightly above the raw grasp point
         self.declare_parameter('approach_offset_z', 0.08)
+
+        # Minimum Z height (in planning frame) — safety floor to prevent
+        # the robot from going below the table surface.
+        self.declare_parameter('min_grasp_z', 0.05)
 
         # Release detection mode:
         #   'timeout'  — wait a fixed duration then proceed (default, works now)
@@ -83,11 +88,14 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('release_detection_mode', 'timeout')
         self.declare_parameter('release_timeout_sec', 3.0)
 
+        self._release_timeout = self.get_parameter('release_timeout_sec').value
+
         # Read parameters
         self._planning_frame = self.get_parameter('planning_frame').value
         self._home_joints = list(self.get_parameter('home_joints').value)
         self._dropoff_joints = list(self.get_parameter('dropoff_joints').value)
         self._approach_offset_z = self.get_parameter('approach_offset_z').value
+        self._min_grasp_z = self.get_parameter('min_grasp_z').value
 
         self._gripper_open_width = self.get_parameter('gripper_open_width').value
         self._gripper_open_speed = self.get_parameter('gripper_open_speed').value
@@ -136,6 +144,22 @@ class HandoverOrchestrator(Node):
             f'Waiting for grasps on '
             f"'{self.get_parameter('selected_grasp_topic').value}'…")
 
+        # Schedule the initial homing sequence to run shortly after startup
+        self._startup_timer = self.create_timer(1.0, self._on_startup_timer, callback_group=cb_group)
+
+    def _on_startup_timer(self) -> None:
+        if self._startup_timer is not None:
+            self._startup_timer.cancel()
+            self._startup_timer = None
+        
+        self.get_logger().info('Performing startup homing...')
+        self._set_state(State.HOMING)
+        if self._arm.move_to_joints(self._home_joints):
+            self.get_logger().info('Startup homing complete. Ready for handovers.')
+        else:
+            self.get_logger().warn('Startup homing failed.')
+        self._set_state(State.IDLE)
+
     # Subscription callbacks
 
     def _on_selected_grasp(self, msg: PoseStamped) -> None:
@@ -163,8 +187,22 @@ class HandoverOrchestrator(Node):
             self._set_state(State.IDLE)
             return
 
-        # Apply approach offset (shift the grasp point upward in robot frame)
-        grasp_in_robot.pose.position.z += self._approach_offset_z
+        # Log the full grasp pose for diagnostics
+        p = grasp_in_robot.pose.position
+        o = grasp_in_robot.pose.orientation
+        approach_dir = self._get_approach_direction(o)
+        self.get_logger().info(
+            f'GRASP DIAGNOSTICS in {self._planning_frame}:\n'
+            f'  position:    ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})\n'
+            f'  quaternion:  ({o.x:.4f}, {o.y:.4f}, {o.z:.4f}, {o.w:.4f})\n'
+            f'  approach_dir (Z-axis): ({approach_dir[0]:.3f}, {approach_dir[1]:.3f}, {approach_dir[2]:.3f})')
+
+        # Safety clamp: prevent the robot from going below the table
+        if grasp_in_robot.pose.position.z < self._min_grasp_z:
+            self.get_logger().warn(
+                f'Grasp Z={grasp_in_robot.pose.position.z:.3f} is below '
+                f'min_grasp_z={self._min_grasp_z:.3f} — clamping to floor.')
+            grasp_in_robot.pose.position.z = self._min_grasp_z
 
         # 1. Open gripper
         if not self._transition(State.OPENING,
@@ -173,7 +211,8 @@ class HandoverOrchestrator(Node):
                                     self._gripper_open_speed)):
             return self._handle_abort()
 
-        # 2. Move arm to grasp pose
+        # 2. Move arm to the actual grasp pose
+        self.get_logger().info('Moving to grasp pose...')
         if not self._transition(State.APPROACHING,
                                 lambda: self._arm.move_to_pose(grasp_in_robot)):
             return self._handle_abort()
@@ -246,6 +285,33 @@ class HandoverOrchestrator(Node):
         try:
             transformed = self._tf_buffer.transform(
                 self._target_grasp, self._planning_frame, timeout=rclpy.duration.Duration(seconds=2))
+            
+            # Prevent the robot arm from wrapping around 360 degrees or twisting awkwardly:
+            # We check if the Franka Hand's X-axis (which points 'up' relative to the fingers)
+            # is pointing downwards in the robot's base frame (Z < 0).
+            # If so, we rotate the grasp 180 degrees around the approach axis (Z-axis).
+            from scipy.spatial.transform import Rotation
+            q = [
+                transformed.pose.orientation.x,
+                transformed.pose.orientation.y,
+                transformed.pose.orientation.z,
+                transformed.pose.orientation.w
+            ]
+            rot = Rotation.from_quat(q)
+            # The X-axis is the first column of the rotation matrix
+            x_axis = rot.as_matrix()[:, 0]
+            
+            if x_axis[2] < 0:
+                self.get_logger().info('Flipping grasp 180 degrees around Z to prevent wrist twist.')
+                # Rotate 180 degrees around local Z-axis
+                rot_180_z = Rotation.from_euler('z', 180, degrees=True)
+                rot_flipped = rot * rot_180_z
+                q_flipped = rot_flipped.as_quat()
+                transformed.pose.orientation.x = q_flipped[0]
+                transformed.pose.orientation.y = q_flipped[1]
+                transformed.pose.orientation.z = q_flipped[2]
+                transformed.pose.orientation.w = q_flipped[3]
+
             self.get_logger().info(
                 f'Transformed grasp: '
                 f'({transformed.pose.position.x:.3f}, '
@@ -259,6 +325,20 @@ class HandoverOrchestrator(Node):
             self.get_logger().error(f'TF lookup failed: {e}')
             self._set_state(State.IDLE)
             return None
+
+    @staticmethod
+    def _get_approach_direction(orientation):
+        """Extract the Z-axis (approach direction) from a quaternion.
+
+        Returns a tuple (x, y, z) representing the third column of the
+        rotation matrix encoded by the quaternion.  Used for diagnostics.
+        """
+        qx, qy, qz, qw = orientation.x, orientation.y, orientation.z, orientation.w
+        return (
+            2.0 * (qx * qz + qw * qy),
+            2.0 * (qy * qz - qw * qx),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        )
 
     def _wait_for_release(self) -> bool:
         """Wait until the human releases the object.

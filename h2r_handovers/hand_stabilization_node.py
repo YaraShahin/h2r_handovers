@@ -27,7 +27,7 @@ class HandStabilizationNode(Node):
         self.declare_parameter('hand_label', HAND_LABEL)
         self.declare_parameter('min_hand_pixels', 50)
         self.declare_parameter('position_tolerance_px', 10.0)
-        self.declare_parameter('min_samples', 5)
+        self.declare_parameter('min_samples', 10)
 
         self._hand_label = self.get_parameter('hand_label').value
         self._min_hand_pixels = self.get_parameter('min_hand_pixels').value
