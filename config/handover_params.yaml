@@ -31,13 +31,14 @@ handover_orchestrator:
     # HOME: safe resting pose — arm is tucked and out of the way,
     #        ready to start a new handover.
     home_joints:
-      - -0.3017     # panda_joint1
-      - -0.9131     # panda_joint2
-      - -1.1905     # panda_joint3
-      - -1.7694     # panda_joint4
-      - -0.8113     # panda_joint5
-      - 1.4376      # panda_joint6
-      - 0.8624      # panda_joint7
+      - 0.02339568794756837
+      - -0.32465551723001435
+      - -0.032348319990882765
+      - -2.5288589074640533
+      - 0.009927281832031128
+      - 2.293500571313975
+      - 0.7461003649698391
+
 
     # DROPOFF: where the robot moves to place the received object.
     dropoff_joints:

@@ -89,11 +89,9 @@ class ArmClient:
         self._client.wait_for_server()
         node.get_logger().info(f'ArmClient: connected to {action_name}')
 
-
-
-    def move_to_pose(self, pose_stamped: PoseStamped) -> bool:
+    def move_to_pose(self, pose_stamped: PoseStamped, planner_id: str = 'PTP') -> bool:
         """Plan and execute to a Cartesian pose goal.  Blocks until done."""
-        request = self._base_request()
+        request = self._base_request(planner_id=planner_id)
 
         # Position constraint — a tiny sphere around the target
         pc = PositionConstraint()
@@ -125,14 +123,14 @@ class ArmClient:
 
         return self._send_and_wait(request, 'move_to_pose')
 
-    def move_to_joints(self, joint_values: list[float]) -> bool:
+    def move_to_joints(self, joint_values: list[float], planner_id: str = 'PTP') -> bool:
         """Plan and execute to a joint-space goal.  Blocks until done."""
         if len(joint_values) != len(self.JOINT_NAMES):
             self._node.get_logger().error(
                 f'Expected {len(self.JOINT_NAMES)} joint values, got {len(joint_values)}')
             return False
 
-        request = self._base_request()
+        request = self._base_request(planner_id=planner_id)
 
         constraint = Constraints()
         for name, value in zip(self.JOINT_NAMES, joint_values):
@@ -149,8 +147,9 @@ class ArmClient:
 
 
 
-    def _base_request(self) -> MotionPlanRequest:
+    def _base_request(self, planner_id: str = 'PTP') -> MotionPlanRequest:
         req = MotionPlanRequest()
+        req.planner_id = planner_id
         req.group_name = self._group
         req.num_planning_attempts = self._num_attempts
         req.allowed_planning_time = self._planning_time

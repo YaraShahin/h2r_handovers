@@ -17,10 +17,12 @@
     <arg name="enable_infra2" value="false"/>
   </include>
 
-  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen"
-        args="-d $(find-pkg-share h2r_handovers)/config/config.rviz"/>
+  <include file="$(find-pkg-share franka_moveit_config)/launch/moveit.launch.py">
+    <arg name="robot_ip" value="172.16.0.2"/>
+  </include>
 
-  <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/>
+  <!-- <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/> -->
+  <!-- <node pkg="h2r_handovers" exec="trigger_node" name="trigger_node" output="screen"/> -->
 
   <node pkg="h2r_handovers" exec="grasp_selection_node" name="grasp_selection_node" output="screen">
     <param from="$(find-pkg-share h2r_handovers)/config/handover_params.yaml" />
