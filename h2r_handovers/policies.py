@@ -8,11 +8,54 @@ To add a new policy, define a function and register it in POLICIES.
 """
 
 
+import numpy as np
 import rclpy
+from scipy.spatial.transform import Rotation
+
+BASE_FRAME = 'panda_link0'
+
 
 def highest_score(poses, frame_id, tf_buffer=None):
     """Pick the top-scored grasp (index 0 — GraspNet sorts by score)."""
     return 0
+
+
+def top_down(poses, frame_id, tf_buffer=None, max_tilt_deg=45.0):
+    """Prefer grasps that approach from above, keeping the robot upright.
+
+    Walks the candidates in GraspNet-score order and returns the first whose
+    approach axis (pose Z) is within *max_tilt_deg* of straight down in the
+    robot base frame. If none qualifies, falls back to the most downward-
+    pointing candidate, so a sideways-only presentation still yields a grasp.
+    """
+    if tf_buffer is None:
+        print('No TF buffer provided to top_down!')
+        return 0
+    try:
+        t = tf_buffer.lookup_transform(
+            BASE_FRAME, frame_id, rclpy.time.Time(),
+            rclpy.duration.Duration(seconds=1.0))
+    except Exception as e:
+        print(f'TF lookup failed in top_down policy: {e}')
+        return 0
+    q = t.transform.rotation
+    rot_to_base = Rotation.from_quat([q.x, q.y, q.z, q.w])
+
+    quats = np.array([
+        [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]
+        for p in poses])
+    approaches = Rotation.from_quat(quats).as_matrix()[:, :, 2]  # pose Z axes
+    downwardness = -rot_to_base.apply(approaches)[:, 2]  # 1.0 = straight down
+
+    threshold = np.cos(np.radians(max_tilt_deg))
+    for i, d in enumerate(downwardness):
+        if d >= threshold:
+            return i
+    best = int(np.argmax(downwardness))
+    print(f'top_down: no grasp within {max_tilt_deg:.0f} deg of vertical — '
+          f'falling back to candidate {best} '
+          f'(tilt {np.degrees(np.arccos(np.clip(downwardness[best], -1, 1))):.0f} deg).')
+    return best
 
 
 def nearest_depth(poses, frame_id, tf_buffer=None):
@@ -81,6 +124,7 @@ def ergonomic(poses, frame_id, tf_buffer=None):
 # Map parameter strings to the corresponding policy functions
 POLICIES = {
     'highest_score': highest_score,
+    'top_down': top_down,
     'nearest_depth': nearest_depth,
     'top_k_aligned': top_k_aligned,
     'ergonomic': ergonomic,

@@ -3,14 +3,18 @@
 Subscribes to the scored grasp candidates from GraspNet and applies a
 configurable selection policy to pick the single best grasp, published as
 a PoseStamped for the orchestrator to act on.
+
+The selected pose is republished unchanged (position + orientation) in the
+camera frame; the orchestrator transforms it into the planning frame via TF.
+The only frame handling here is an optional frame_id override used to route
+the pose through the calibration-correction frame published in
+handover.launch.xml, instead of baking that correction into the pose values.
 """
 
 import rclpy
 from geometry_msgs.msg import PoseArray, PoseStamped
 from rclpy.node import Node
 import tf2_ros
-import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 from h2r_handovers.policies import POLICIES
 
@@ -25,7 +29,11 @@ class GraspSelectionNode(Node):
 
         self.declare_parameter('input_topic', 'grasp_candidates')
         self.declare_parameter('output_topic', 'selected_grasp')
-        self.declare_parameter('policy', 'top_k_aligned')
+        self.declare_parameter('policy', 'highest_score')
+        # If non-empty, replaces the frame_id on the published pose. Used to
+        # stamp poses with the calibration-correction frame from
+        # handover.launch.xml; set to '' once the camera is recalibrated.
+        self.declare_parameter('output_frame', 'camera_color_optical_corrected')
 
         policy_name = self.get_parameter('policy').value
         if policy_name not in POLICIES:
@@ -36,6 +44,7 @@ class GraspSelectionNode(Node):
         self._policy = POLICIES[policy_name]
         self._policy_name = policy_name
 
+        self._output_frame = self.get_parameter('output_frame').value
         input_topic = self.get_parameter('input_topic').value
         output_topic = self.get_parameter('output_topic').value
 
@@ -51,56 +60,22 @@ class GraspSelectionNode(Node):
             self.get_logger().warn('Received empty PoseArray, skipping.', throttle_duration_sec=5.0)
             return
 
-        self.get_logger().warn(f'hyeyyyy {msg.header.frame_id}')
-        idx = self._policy(msg.poses, msg.header.frame_id, self._tf_buffer)
+        frame_id = self._output_frame or msg.header.frame_id
+
+        idx = self._policy(msg.poses, frame_id, self._tf_buffer)
         idx = max(0, min(idx, len(msg.poses) - 1))  # clamp
-
-        try:
-            # Get transform from camera to panda_link0
-            transform = self._tf_buffer.lookup_transform(
-                'panda_link0',
-                msg.header.frame_id,
-                rclpy.time.Time()
-            )
-        except Exception as e:
-            self.get_logger().error(f"Failed to lookup transform: {e}")
-            return
-
-        import numpy as np
-        from scipy.spatial.transform import Rotation as R
-        
-        t = transform.transform.translation
-        r = transform.transform.rotation
-        rot_cam = R.from_quat([r.x, r.y, r.z, r.w])
-        
-        # Invert X and Y to perfectly compensate for the opposite corner mirroring
-        pos_cam = np.array([-msg.poses[idx].position.x, -msg.poses[idx].position.y, msg.poses[idx].position.z])
-        pos_world = rot_cam.apply(pos_cam) + np.array([t.x, t.y, t.z])
-        
-        # Apply the exact offsets from the old ROS1 pipeline
-        pos_world[1] += 0.09
-        pos_world[2] += 0.09
 
         result = PoseStamped()
         result.header.stamp = msg.header.stamp
-        result.header.frame_id = 'panda_link0'
-        
-        result.pose.position.x = float(pos_world[0])
-        result.pose.position.y = float(pos_world[1])
-        result.pose.position.z = float(pos_world[2])
-        
-        # Hardcode orientation to point perfectly straight down
-        result.pose.orientation.x = 1.0
-        result.pose.orientation.y = 0.0
-        result.pose.orientation.z = 0.0
-        result.pose.orientation.w = 0.0
+        result.header.frame_id = frame_id
+        result.pose = msg.poses[idx]
 
-        self.get_logger().info('Published straight-down grasp in panda_link0')
         self._pub.publish(result)
 
+        p = result.pose.position
         self.get_logger().info(
-            f"Selected grasp {idx}/{len(msg.poses)} via '{self._policy_name}' with value {msg.poses[idx]}",
-            throttle_duration_sec=2.0)
+            f"Selected grasp {idx + 1}/{len(msg.poses)} via '{self._policy_name}': "
+            f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) in '{frame_id}'")
 
 
 def main(args=None):

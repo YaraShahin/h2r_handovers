@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'hand_stabilization_node = h2r_handovers.hand_stabilization_node:main',
-            'trigger_node = h2r_handovers.trigger_node:main',
             'grasp_selection_node = h2r_handovers.grasp_selection_node:main',
             'handover_orchestrator = h2r_handovers.handover_orchestrator:main',
         ],

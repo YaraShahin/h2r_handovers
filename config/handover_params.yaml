@@ -3,20 +3,49 @@ grasp_selection_node:
   ros__parameters:
     input_topic: "grasp_candidates"
     output_topic: "selected_grasp"
-    # Available policies: highest_score, nearest_depth, ergonomic (placeholder)
-    policy: "highest_score"
+    # Available policies: highest_score, top_down, nearest_depth,
+    # top_k_aligned, ergonomic (placeholder).
+    # top_down: best-scored grasp whose approach axis is within ~45 deg of
+    # straight down in panda_link0 — keeps the robot upright.
+    policy: "top_down"
+    # Poses are stamped in this frame — the calibration-correction frame
+    # published in handover.launch.xml. Set to "" (keep the camera frame)
+    # after recalibrating the camera extrinsics.
+    output_frame: "camera_color_optical_corrected"
 
 #  Handover Orchestrator
 handover_orchestrator:
   ros__parameters:
     selected_grasp_topic: "selected_grasp"
+
+    # Capture — Enter in the orchestrator terminal arms one capture.
+    capture_trigger_topic: "capture_trigger"
+    hand_status_topic: "hand_stability_status"
+    system_state_topic: "system_state"
+    # If true, an armed capture waits for 'hand_stable' before triggering
+    # GraspNet (requires hand_stabilization_node to be running).
+    require_stable_hand: false
+    hand_wait_timeout_sec: 30.0
+    # How long to wait for a selected grasp after the trigger (covers EgoHOS
+    # latency and the GraspNet driver's retry attempts).
+    capture_timeout_sec: 15.0
     # MoveIt / Arm
     planning_group: "panda_arm"
     planning_frame: "panda_link0"
-    ee_link: "panda_hand"
-    max_velocity_scaling: 0.2
+    # Goal poses target the TCP (grip centre between the fingertips),
+    # not the panda_hand flange — easier to visualize and no manual
+    # hand-to-fingertip offset needed.
+    ee_link: "panda_hand_tcp"
+    # Kept low for early hardware tests — raise (e.g. 0.2) once the
+    # calibration and grasp poses are trusted.
+    max_velocity_scaling: 0.1
     max_acceleration_scaling: 0.1
     planning_time: 5.0
+
+    # Plan first, execute only after Enter is pressed in the orchestrator
+    # terminal (inspect the Planned Path in RViz). Requires running the
+    # orchestrator in its own terminal, not under `ros2 launch`.
+    confirm_before_execute: true
 
     # Gripper
     gripper_open_width: 0.08          # metres — fully open
@@ -51,13 +80,34 @@ handover_orchestrator:
       - 0.8629
 
     # Approach
-    # Offset applied along the planning-frame Z axis (upward) to the raw
-    # grasp point, so the arm approaches slightly above.
-    approach_offset_z: 0.08
+    # The arm first moves to a pre-grasp pose backed off this far along the
+    # grasp's approach axis (TCP -Z), then does a short straight final approach.
+    approach_distance: 0.10
 
     # Safety floor: minimum Z height in planning frame.
     # Prevents the robot from going below the table surface.
-    min_grasp_z: 0.05
+    min_grasp_z: 0.0
+
+    # Offset applied to the final grasp pose, expressed in the TCP frame
+    # (metres): x across the fingers ('up' relative to them), y along the
+    # finger-closing axis, z along the approach axis (negative backs off).
+    # t 1: y & z need more pos
+    # t 2: x & z need more pos
+    # t 3: just z more pos
+    # t 4: 
+    grasp_offset_tcp: [0.035, -0.09, 0.03]
+
+    # Override GraspNet's orientation so the approach is always straight down
+    # (world -Z), keeping only the yaw so the fingers stay aligned with the
+    # object. With this on, TCP -z in grasp_offset_tcp means straight up.
+    force_top_down_grasp: true
+
+    # Table collision box (added to the MoveIt planning scene at startup so
+    # planned paths can't sweep through the table). Centre and size in
+    # panda_link0, metres; top surface sits 6 cm below the mounting plane.
+    table_enable: true
+    table_position: [0.4, 0.0, -0.1]
+    table_size: [1.2, 1.2, 0.05]
 
     # Release detection
     # 'timeout' — wait a fixed duration before retreating (works now)

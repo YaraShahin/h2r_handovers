@@ -21,7 +21,7 @@ from rclpy.node import Node
 from franka_msgs.action import Grasp as GraspAction
 from franka_msgs.action import Move as MoveAction
 from geometry_msgs.msg import Pose, PoseStamped
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     Constraints,
@@ -87,10 +87,19 @@ class ArmClient:
         self._client = ActionClient(node, MoveGroup, action_name)
         node.get_logger().info(f'ArmClient: waiting for {action_name}…')
         self._client.wait_for_server()
+        self._exec_client = ActionClient(node, ExecuteTrajectory, '/execute_trajectory')
+        node.get_logger().info('ArmClient: waiting for /execute_trajectory…')
+        self._exec_client.wait_for_server()
         node.get_logger().info(f'ArmClient: connected to {action_name}')
 
-    def move_to_pose(self, pose_stamped: PoseStamped, planner_id: str = 'PTP') -> bool:
-        """Plan and execute to a Cartesian pose goal.  Blocks until done."""
+    def move_to_pose(self, pose_stamped: PoseStamped, planner_id: str = 'PTP',
+                     confirm: Callable[[], bool] | None = None) -> bool:
+        """Plan and execute to a Cartesian pose goal.  Blocks until done.
+
+        If *confirm* is given, it is called after planning succeeds (the planned
+        trajectory is visible in RViz at that point); execution only proceeds
+        if it returns True.
+        """
         request = self._base_request(planner_id=planner_id)
 
         # Position constraint — a tiny sphere around the target
@@ -121,9 +130,10 @@ class ArmClient:
         constraint.orientation_constraints.append(oc)
         request.goal_constraints.append(constraint)
 
-        return self._send_and_wait(request, 'move_to_pose')
+        return self._plan_then_execute(request, 'move_to_pose', confirm)
 
-    def move_to_joints(self, joint_values: list[float], planner_id: str = 'PTP') -> bool:
+    def move_to_joints(self, joint_values: list[float], planner_id: str = 'PTP',
+                       confirm: Callable[[], bool] | None = None) -> bool:
         """Plan and execute to a joint-space goal.  Blocks until done."""
         if len(joint_values) != len(self.JOINT_NAMES):
             self._node.get_logger().error(
@@ -143,7 +153,7 @@ class ArmClient:
             constraint.joint_constraints.append(jc)
         request.goal_constraints.append(constraint)
 
-        return self._send_and_wait(request, 'move_to_joints')
+        return self._plan_then_execute(request, 'move_to_joints', confirm)
 
 
 
@@ -157,33 +167,51 @@ class ArmClient:
         req.max_acceleration_scaling_factor = self._max_acc
         return req
 
-    def _send_and_wait(self, request: MotionPlanRequest, label: str) -> bool:
+    def _plan_then_execute(self, request: MotionPlanRequest, label: str,
+                           confirm: Callable[[], bool] | None = None) -> bool:
+        """Plan the motion, optionally wait for confirmation, then execute it.
+
+        Planning and execution are two separate MoveIt actions so the planned
+        trajectory can be inspected in RViz (move_group publishes it on
+        /display_planned_path) before the robot moves.
+        """
         goal = MoveGroup.Goal()
         goal.request = request
         goal.planning_options = PlanningOptions()
-        goal.planning_options.plan_only = False  # plan AND execute
+        goal.planning_options.plan_only = True
 
-        self._node.get_logger().info(f'ArmClient: sending {label} goal…')
-        future = self._client.send_goal_async(goal)
-        goal_handle = _wait_future(future)
-
+        self._node.get_logger().info(f'ArmClient: planning {label}…')
+        goal_handle = _wait_future(self._client.send_goal_async(goal))
         if not goal_handle.accepted:
-            self._node.get_logger().error(f'ArmClient: {label} goal REJECTED')
+            self._node.get_logger().error(f'ArmClient: {label} planning goal REJECTED')
             return False
 
-        self._node.get_logger().info(f'ArmClient: {label} goal accepted, executing…')
+        plan_result = _wait_future(goal_handle.get_result_async()).result
+        if plan_result.error_code.val != MoveItErrorCodes.SUCCESS:
+            self._node.get_logger().error(
+                f'ArmClient: {label} planning failed (error code {plan_result.error_code.val})')
+            return False
 
-        # Wait for result
-        result_future = goal_handle.get_result_async()
-        result = _wait_future(result_future)
+        if confirm is not None and not confirm():
+            self._node.get_logger().warn(f'ArmClient: {label} execution declined by user.')
+            return False
 
-        if result.result.error_code.val == MoveItErrorCodes.SUCCESS:
+        exec_goal = ExecuteTrajectory.Goal()
+        exec_goal.trajectory = plan_result.planned_trajectory
+
+        self._node.get_logger().info(f'ArmClient: executing {label}…')
+        exec_handle = _wait_future(self._exec_client.send_goal_async(exec_goal))
+        if not exec_handle.accepted:
+            self._node.get_logger().error(f'ArmClient: {label} execution goal REJECTED')
+            return False
+
+        exec_result = _wait_future(exec_handle.get_result_async()).result
+        if exec_result.error_code.val == MoveItErrorCodes.SUCCESS:
             self._node.get_logger().info(f'ArmClient: {label} succeeded')
             return True
-        else:
-            self._node.get_logger().error(
-                f'ArmClient: {label} failed (error code {result.result.error_code.val})')
-            return False
+        self._node.get_logger().error(
+            f'ArmClient: {label} execution failed (error code {exec_result.error_code.val})')
+        return False
 
 
 # Franka gripper action servers wrapper
