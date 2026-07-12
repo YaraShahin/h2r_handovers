@@ -34,6 +34,7 @@ import time
 import rclpy
 import copy
 from geometry_msgs.msg import Pose, PoseStamped
+from scipy.spatial.transform import Rotation
 from moveit_msgs.msg import (AllowedCollisionEntry, CollisionObject,
                              PlanningScene, PlanningSceneComponents)
 from moveit_msgs.srv import GetPlanningScene
@@ -122,10 +123,17 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('dropoff_joints', [
             0.0761, 0.0087, 0.0108, -2.7316, -0.0448, 2.7889, 0.8629])
 
+        # Fingertip TCP offset — MoveIt places the panda_hand frame ORIGIN
+        # (hand base) at the goal, but the grip centre between the fingertip
+        # contacts sits this far along the hand's +Z (approach) axis. The
+        # commanded hand pose is backed off by this so the fingertips land
+        # exactly on the grasp point.
+        self.declare_parameter('hand_tcp_offset', 0.1034)
+
         # Pre-grasp distance — the arm first moves to a pose backed off this
         # far along the grasp's own approach axis (TCP -Z), then covers the
         # remaining distance in a short, straight final approach.
-        self.declare_parameter('approach_distance', 0.10)
+        self.declare_parameter('pregrasp_distance', 0.10)
 
         # If true, every arm motion is planned first and only executed after
         # the user confirms with Enter (inspect the trajectory in RViz via the
@@ -167,7 +175,8 @@ class HandoverOrchestrator(Node):
         self._planning_frame = self.get_parameter('planning_frame').value
         self._home_joints = list(self.get_parameter('home_joints').value)
         self._dropoff_joints = list(self.get_parameter('dropoff_joints').value)
-        self._approach_distance = self.get_parameter('approach_distance').value
+        self._hand_tcp_offset = self.get_parameter('hand_tcp_offset').value
+        self._pregrasp_distance = self.get_parameter('pregrasp_distance').value
         self._confirm_before_execute = self.get_parameter('confirm_before_execute').value
         self._min_grasp_z = self.get_parameter('min_grasp_z').value
         self._grasp_offset_tcp = list(self.get_parameter('grasp_offset_tcp').value)
@@ -208,6 +217,7 @@ class HandoverOrchestrator(Node):
         self._state = State.STARTUP
         self._sequence_confirmed = False
         self._target_grasp: PoseStamped | None = None
+        self._trigger_time: float | None = None  # Enter press, for trigger→grasp timing
         self._hand_status: str | None = None
         self._capture_lock = threading.Lock()
 
@@ -284,6 +294,7 @@ class HandoverOrchestrator(Node):
     def _run_capture(self) -> None:
         """Arm one capture: optionally wait for a stable hand, trigger GraspNet,
         then wait for the handover to take over (or time out back to IDLE)."""
+        self._trigger_time = time.monotonic()
         if self._require_stable_hand:
             self._set_state(State.WAITING_FOR_HAND)
             deadline = time.monotonic() + self._hand_wait_timeout
@@ -363,20 +374,32 @@ class HandoverOrchestrator(Node):
             f'  quaternion:  ({o.x:.4f}, {o.y:.4f}, {o.z:.4f}, {o.w:.4f})\n'
             f'  approach_dir (Z-axis): ({approach_dir[0]:.3f}, {approach_dir[1]:.3f}, {approach_dir[2]:.3f})')
 
-        # Safety clamp: prevent the robot from going below the table
-        if grasp_in_robot.pose.position.z < self._min_grasp_z:
-            self.get_logger().warn(
-                f'Grasp Z={grasp_in_robot.pose.position.z:.3f} is below '
-                f'min_grasp_z={self._min_grasp_z:.3f} — clamping to floor.')
-            grasp_in_robot.pose.position.z = self._min_grasp_z
+
+        # TCP compensation: goal poses command the panda_hand frame origin
+        # (hand base), but the fingertip grip centre is hand_tcp_offset
+        # further along the approach axis. Back the hand pose off so the
+        # fingertips — not the hand base — land on the grasp point.
+        hand_grasp = copy.deepcopy(grasp_in_robot)
+        hand_grasp.pose.position.x -= approach_dir[0] * self._hand_tcp_offset
+        hand_grasp.pose.position.y -= approach_dir[1] * self._hand_tcp_offset
+        hand_grasp.pose.position.z -= approach_dir[2] * self._hand_tcp_offset
 
         # Pre-grasp pose: backed off from the grasp along its approach axis,
         # so the final segment is a short, predictable straight-in motion.
-        pre_grasp = copy.deepcopy(grasp_in_robot)
-        pre_grasp.pose.position.x -= approach_dir[0] * self._approach_distance
-        pre_grasp.pose.position.y -= approach_dir[1] * self._approach_distance
-        pre_grasp.pose.position.z -= approach_dir[2] * self._approach_distance
+        pre_grasp = copy.deepcopy(hand_grasp)
+        pre_grasp.pose.position.x -= approach_dir[0] * self._pregrasp_distance
+        pre_grasp.pose.position.y -= approach_dir[1] * self._pregrasp_distance
+        pre_grasp.pose.position.z -= approach_dir[2] * self._pregrasp_distance
         pre_grasp.pose.position.z = max(pre_grasp.pose.position.z, self._min_grasp_z)
+
+        hp = hand_grasp.pose.position
+        pp = pre_grasp.pose.position
+        self.get_logger().info(
+            f'Hand-base targets in {self._planning_frame} '
+            f'(hand_tcp_offset={self._hand_tcp_offset:.4f} m, '
+            f'pregrasp_distance={self._pregrasp_distance:.3f} m):\n'
+            f'  pre-grasp: ({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})\n'
+            f'  grasp:     ({hp.x:.3f}, {hp.y:.3f}, {hp.z:.3f})')
 
         # 1. Open gripper
         if not self._transition(State.OPENING,
@@ -395,7 +418,7 @@ class HandoverOrchestrator(Node):
         # 3. Final approach along the grasp axis onto the object
         self.get_logger().info('Final approach to grasp pose...')
         if not self._transition(State.REACHING,
-                                lambda: self._final_approach(grasp_in_robot)):
+                                lambda: self._final_approach(hand_grasp)):
             return self._handle_abort()
 
         # 4. Close gripper on the object
@@ -407,6 +430,13 @@ class HandoverOrchestrator(Node):
                                     self._grasp_eps_inner,
                                     self._grasp_eps_outer)):
             return self._handle_abort()
+
+        trigger_to_grasp = (time.monotonic() - self._trigger_time
+                            if self._trigger_time is not None else None)
+        if trigger_to_grasp is not None:
+            self.get_logger().info(
+                f'Trigger→grasp time: {trigger_to_grasp:.2f} s '
+                '(Enter press to gripper closed).')
 
         # 5. Wait for human to release the object
         if not self._transition(State.HOLDING, self._wait_for_release):
@@ -438,7 +468,9 @@ class HandoverOrchestrator(Node):
             return self._handle_abort()
 
         self._set_state(State.IDLE)
-        self.get_logger().info('Handover complete — ready for next')
+        timing = (f' (trigger→grasp {trigger_to_grasp:.2f} s)'
+                  if trigger_to_grasp is not None else '')
+        self.get_logger().info(f'Handover complete{timing} — ready for next')
 
     # Helpers
 
@@ -670,15 +702,12 @@ class HandoverOrchestrator(Node):
     def _get_approach_direction(orientation):
         """Extract the Z-axis (approach direction) from a quaternion.
 
-        Returns a tuple (x, y, z) representing the third column of the
-        rotation matrix encoded by the quaternion.  Used for diagnostics.
+        Returns the third column of the rotation matrix encoded by the
+        quaternion — the gripper approach axis in the planning frame.
         """
-        qx, qy, qz, qw = orientation.x, orientation.y, orientation.z, orientation.w
-        return (
-            2.0 * (qx * qz + qw * qy),
-            2.0 * (qy * qz - qw * qx),
-            1.0 - 2.0 * (qx * qx + qy * qy),
-        )
+        rot = Rotation.from_quat(
+            [orientation.x, orientation.y, orientation.z, orientation.w])
+        return rot.as_matrix()[:, 2]
 
     def _wait_for_release(self) -> bool:
         """Wait until the human releases the object.

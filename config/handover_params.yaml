@@ -4,10 +4,22 @@ grasp_selection_node:
     input_topic: "grasp_candidates"
     output_topic: "selected_grasp"
     # Available policies: highest_score, top_down, nearest_depth,
-    # top_k_aligned, ergonomic (placeholder).
-    # top_down: best-scored grasp whose approach axis is within ~45 deg of
-    # straight down in panda_link0 — keeps the robot upright.
-    policy: "top_down"
+    # top_k_aligned, ergonomic.
+    # ergonomic: hybrid score / hand-clearance — reports the highest-score
+    # grasp and the grasp furthest from the hand centre (published by the
+    # GraspNet driver on 'hand_center') plus the distance between the two,
+    # and picks the max-clearance one. Falls back to highest_score when the
+    # hand is not visible.
+    # top_down: best-scored grasp whose approach axis is within
+    # top_down_max_tilt_deg of straight down in panda_link0.
+    policy: "ergonomic"
+    # Maximum tilt (degrees) from vertical for the top_down policy.
+    top_down_max_tilt_deg: 30.0
+    # true  — candidates outside the cone are rejected; if none qualifies,
+    #         nothing is published and the capture times out back to IDLE.
+    # false — the most downward-pointing candidate is used as a fallback,
+    #         so a sideways-only presentation still yields a grasp.
+    top_down_strict: false
     # Poses are stamped in this frame — the calibration-correction frame
     # published in handover.launch.xml. Set to "" (keep the camera frame)
     # after recalibrating the camera extrinsics.
@@ -32,13 +44,14 @@ handover_orchestrator:
     # MoveIt / Arm
     planning_group: "panda_arm"
     planning_frame: "panda_link0"
-    # Goal poses target the TCP (grip centre between the fingertips),
-    # not the panda_hand flange — easier to visualize and no manual
-    # hand-to-fingertip offset needed.
-    ee_link: "panda_hand_tcp"
+    # Goal poses command the panda_hand frame (hand base). The fingertip
+    # TCP is compensated explicitly via hand_tcp_offset below — do NOT set
+    # this to panda_hand_tcp (not confirmed to exist in the SRDF), or the
+    # offset would be applied twice.
+    ee_link: "panda_hand"
     # Kept low for early hardware tests — raise (e.g. 0.2) once the
     # calibration and grasp poses are trusted.
-    max_velocity_scaling: 0.1
+    max_velocity_scaling: 0.2
     max_acceleration_scaling: 0.1
     planning_time: 5.0
 
@@ -80,9 +93,14 @@ handover_orchestrator:
       - 0.8629
 
     # Approach
+    # Fingertip TCP offset (metres): the panda_hand frame origin sits at the
+    # hand base; the grip centre between the fingertip contacts is this far
+    # along the hand's +Z (approach) axis. The commanded hand pose is backed
+    # off by this so the fingertips land exactly on the grasp point.
+    hand_tcp_offset: 0.1034
     # The arm first moves to a pre-grasp pose backed off this far along the
     # grasp's approach axis (TCP -Z), then does a short straight final approach.
-    approach_distance: 0.10
+    pregrasp_distance: 0.10
 
     # Safety floor: minimum Z height in planning frame.
     # Prevents the robot from going below the table surface.
@@ -105,7 +123,7 @@ handover_orchestrator:
     # Table collision box (added to the MoveIt planning scene at startup so
     # planned paths can't sweep through the table). Centre and size in
     # panda_link0, metres; top surface sits 6 cm below the mounting plane.
-    table_enable: true
+    table_enable: false
     table_position: [0.4, 0.0, -0.1]
     table_size: [1.2, 1.2, 0.05]
 

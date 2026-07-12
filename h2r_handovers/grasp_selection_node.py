@@ -11,8 +11,10 @@ the pose through the calibration-correction frame published in
 handover.launch.xml, instead of baking that correction into the pose values.
 """
 
+from functools import partial
+
 import rclpy
-from geometry_msgs.msg import PoseArray, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseArray, PoseStamped
 from rclpy.node import Node
 import tf2_ros
 
@@ -30,6 +32,15 @@ class GraspSelectionNode(Node):
         self.declare_parameter('input_topic', 'grasp_candidates')
         self.declare_parameter('output_topic', 'selected_grasp')
         self.declare_parameter('policy', 'highest_score')
+        # 'top_down' policy only: maximum tilt (degrees) of the approach axis
+        # from straight-down in panda_link0, and whether candidates outside
+        # that cone are rejected outright (strict) or the most downward-
+        # pointing one is used as a fallback (non-strict, old behaviour).
+        self.declare_parameter('top_down_max_tilt_deg', 45.0)
+        self.declare_parameter('top_down_strict', True)
+        # 'ergonomic' policy only: 3-D hand centroid published by the GraspNet
+        # driver (same camera frame and header stamp as the candidates).
+        self.declare_parameter('hand_center_topic', 'hand_center')
         # If non-empty, replaces the frame_id on the published pose. Used to
         # stamp poses with the calibration-correction frame from
         # handover.launch.xml; set to '' once the camera is recalibrated.
@@ -43,6 +54,15 @@ class GraspSelectionNode(Node):
             policy_name = 'highest_score'
         self._policy = POLICIES[policy_name]
         self._policy_name = policy_name
+        if policy_name == 'top_down':
+            max_tilt = self.get_parameter('top_down_max_tilt_deg').value
+            strict = self.get_parameter('top_down_strict').value
+            self._policy = partial(self._policy, max_tilt_deg=max_tilt, strict=strict)
+            self.get_logger().info(
+                f'top_down policy: grasps tilted more than {max_tilt:.0f} deg '
+                f'from vertical are '
+                + ('rejected (strict).' if strict
+                   else 'allowed as fallback (non-strict).'))
 
         self._output_frame = self.get_parameter('output_frame').value
         input_topic = self.get_parameter('input_topic').value
@@ -50,10 +70,28 @@ class GraspSelectionNode(Node):
 
         self._pub = self.create_publisher(PoseStamped, output_topic, 1)
         self.create_subscription(PoseArray, input_topic, self._on_candidates, 10)
+        self._last_hand_center: PointStamped | None = None
+        self.create_subscription(
+            PointStamped, self.get_parameter('hand_center_topic').value,
+            self._on_hand_center, 10)
 
         self.get_logger().info(
             f"Grasp selection: policy='{policy_name}', "
             f"subscribing to '{input_topic}', publishing to '{output_topic}'")
+
+    def _on_hand_center(self, msg: PointStamped) -> None:
+        self._last_hand_center = msg
+
+    def _fresh_hand_center(self, stamp):
+        """Hand centroid matching this inference's stamp, or None.
+
+        The driver publishes the centroid right before the candidates with
+        the same header stamp, so a mismatch means the hand was not visible
+        in this inference (or the cached point is from an older capture)."""
+        hc = self._last_hand_center
+        if hc is None or hc.header.stamp != stamp:
+            return None
+        return (hc.point.x, hc.point.y, hc.point.z)
 
     def _on_candidates(self, msg: PoseArray) -> None:
         if not msg.poses:
@@ -62,7 +100,22 @@ class GraspSelectionNode(Node):
 
         frame_id = self._output_frame or msg.header.frame_id
 
-        idx = self._policy(msg.poses, frame_id, self._tf_buffer)
+        kwargs = {'logger': self.get_logger()}
+        if self._policy_name == 'ergonomic':
+            kwargs['hand_center'] = self._fresh_hand_center(msg.header.stamp)
+
+        idx = self._policy(msg.poses, frame_id, self._tf_buffer, **kwargs)
+        # ergonomic returns (index, debug string) — log the string from this
+        # node so it lands in its console output and /rosout.
+        if isinstance(idx, tuple):
+            idx, debug = idx
+            if debug:
+                self.get_logger().info(debug)
+        if idx is None:
+            self.get_logger().warn(
+                f"Policy '{self._policy_name}' rejected all {len(msg.poses)} "
+                'candidates — nothing published for this capture.')
+            return
         idx = max(0, min(idx, len(msg.poses) - 1))  # clamp
 
         result = PoseStamped()
