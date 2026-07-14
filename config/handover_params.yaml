@@ -20,7 +20,7 @@ handover_orchestrator:
     system_state_topic: "system_state"
     
     # 'auto' (hand stability) or 'manual' (Enter key)
-    trigger_mode: "auto"
+    trigger_mode: "manual"
     hand_wait_timeout_sec: 30.0
     
     capture_timeout_sec: 15.0
@@ -34,7 +34,7 @@ handover_orchestrator:
     planning_time: 5.0
 
     # Requires orchestrator terminal
-    confirm_before_execute: true
+    confirm_before_execute: false
 
     gripper_open_width: 0.08
     gripper_open_speed: 0.1
@@ -70,7 +70,7 @@ handover_orchestrator:
     grasp_offset_tcp: [0.035, -0.09, 0.03]
 
     # Orient downwards regardless of prediction
-    force_top_down_grasp: true
+    force_top_down_grasp: false
 
     table_enable: false
     table_position: [0.4, 0.0, -0.1]

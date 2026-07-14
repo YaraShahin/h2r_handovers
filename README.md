@@ -190,6 +190,7 @@ Starts the Realsense camera, hand stabilization, MoveIt, and the main handover s
 ```bash
 source ~/handover_ws/install/setup.bash
 ros2 launch h2r_handovers handover.launch.xml
+ros2 run h2r_handovers handover_orchestrator
 ```
 
 ### Terminal 2: EgoHOS Driver

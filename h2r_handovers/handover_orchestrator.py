@@ -27,6 +27,9 @@ import tf2_geometry_msgs
 from h2r_handovers.hand_stabilization_node import STATUS_STABLE
 from h2r_handovers.panda_client import ArmClient, GripperClient
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
 
 def _flush_stdin() -> None:
     """Drop buffered keypresses so a stray Enter can't confirm a motion."""
@@ -573,8 +576,6 @@ class HandoverOrchestrator(Node):
 
     def _force_top_down_orientation(self, pose: Pose) -> None:
         """Projects the finger-closing axis onto the horizontal plane to force a vertical approach while maintaining yaw alignment."""
-        import numpy as np
-        from scipy.spatial.transform import Rotation
         q = pose.orientation
         closing = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()[:, 1]
         closing[2] = 0.0
