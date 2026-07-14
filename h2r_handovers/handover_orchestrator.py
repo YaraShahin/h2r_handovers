@@ -169,6 +169,7 @@ class HandoverOrchestrator(Node):
         self._state = State.STARTUP
         self._sequence_confirmed = False
         self._target_grasp: PoseStamped | None = None
+        self._grasp_was_flipped: bool = False
         self._trigger_time: float | None = None
         self._hand_status: str | None = None
         self._capture_lock = threading.Lock()
@@ -549,7 +550,8 @@ class HandoverOrchestrator(Node):
             # The X-axis is the first column of the rotation matrix
             x_axis = rot.as_matrix()[:, 0]
             
-            if x_axis[2] < 0:
+            self._grasp_was_flipped = x_axis[2] < 0
+            if self._grasp_was_flipped:
                 self.get_logger().info('Flipping grasp 180 degrees around Z to prevent wrist twist.')
                 # Rotate 180 degrees around local Z-axis
                 rot_180_z = Rotation.from_euler('z', 180, degrees=True)
@@ -590,10 +592,13 @@ class HandoverOrchestrator(Node):
         self.get_logger().info('Forced top-down grasp orientation (yaw kept).')
 
     def _apply_grasp_offset(self, pose: Pose) -> None:
-        """Applies a translational offset in the TCP frame (post-rotation) for fine-tuning grasp depth/centering."""
-        offset = self._grasp_offset_tcp
+        """Applies a translational offset in the TCP frame for fine-tuning grasp depth/centering."""
+        offset = list(self._grasp_offset_tcp)
         if not any(offset):
             return
+        if self._grasp_was_flipped:
+            offset[0] = -offset[0]
+            offset[1] = -offset[1]
         from scipy.spatial.transform import Rotation
         q = pose.orientation
         shift = Rotation.from_quat([q.x, q.y, q.z, q.w]).apply(offset)
@@ -601,7 +606,8 @@ class HandoverOrchestrator(Node):
         pose.position.y += shift[1]
         pose.position.z += shift[2]
         self.get_logger().info(
-            f'Applied TCP-frame grasp offset {offset} → shift in '
+            f'Applied TCP-frame grasp offset {offset}'
+            f'{" (flip-compensated)" if self._grasp_was_flipped else ""} → shift in '
             f'{self._planning_frame}: ({shift[0]:.3f}, {shift[1]:.3f}, {shift[2]:.3f})')
 
     @staticmethod

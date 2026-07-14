@@ -70,7 +70,7 @@ handover_orchestrator:
     grasp_offset_tcp: [0.035, -0.09, 0.03]
 
     # Orient downwards regardless of prediction
-    force_top_down_grasp: false
+    force_top_down_grasp: true
 
     table_enable: false
     table_position: [0.4, 0.0, -0.1]
