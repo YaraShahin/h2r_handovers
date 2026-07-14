@@ -1,28 +1,4 @@
-"""Handover orchestrator — state machine that coordinates the full H2R handover.
-
-This is the single operator console for the pipeline: per handover you press
-Enter once to *capture* (triggers GraspNet inference, optionally gated on the
-hand-stabilization status) and then Enter to confirm each planned arm motion
-before it executes.
-
-Lifecycle:
-    STARTUP    →  homing  →  IDLE
-    IDLE       →  Enter pressed
-    (WAITING_FOR_HAND  →  'hand_stable', if require_stable_hand)
-    CAPTURING  →  capture trigger published, wait for selected_grasp
-    PLANNING   →  transform grasp into the robot planning frame
-               →  open gripper  →  pre-grasp (APPROACHING)  →  straight final
-                  approach (REACHING)  →  close gripper (GRASPING)
-               →  wait for human to release (HOLDING)
-               →  retreat to HOME  →  DROPOFF  →  release  →  return HOME
-               →  IDLE (ready for next handover)
-
-The current state is published on 'system_state' (latched) so the rest of the
-system — and any UI — sees one unified state machine, including the capture /
-hand-stability phase.
-
-All arm and gripper commands use the action-client helpers in ``panda_client``.
-"""
+"""Handover orchestrator state machine. Coordinates the full H2R handover pipeline."""
 
 from __future__ import annotations
 
@@ -63,13 +39,12 @@ def _flush_stdin() -> None:
 
 class State(enum.Enum):
     STARTUP = 'STARTUP'
-    IDLE = 'IDLE'                             # waiting for Enter to arm a capture
-    WAITING_FOR_HAND = 'WAITING_FOR_HAND'     # capture armed, waiting for hand_stable
-    CAPTURING = 'CAPTURING'                   # trigger sent, waiting for a selected grasp
-    PLANNING = 'PLANNING'                     # grasp received, transforming/validating
+    IDLE = 'IDLE'
+    CAPTURING = 'CAPTURING'
+    PLANNING = 'PLANNING'
     OPENING = 'OPENING'
-    APPROACHING = 'APPROACHING'   # moving to the pre-grasp pose
-    REACHING = 'REACHING'         # final approach from pre-grasp to grasp
+    APPROACHING = 'APPROACHING'
+    REACHING = 'REACHING'
     GRASPING = 'GRASPING'
     HOLDING = 'HOLDING'
     RETREATING = 'RETREATING'
@@ -90,12 +65,8 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('capture_trigger_topic', 'capture_trigger')
         self.declare_parameter('hand_status_topic', 'hand_stability_status')
         self.declare_parameter('system_state_topic', 'system_state')
-        # If true, an armed capture only fires once the hand-stabilization
-        # node reports 'hand_stable' (requires hand_stabilization_node running).
-        self.declare_parameter('require_stable_hand', False)
+        self.declare_parameter('trigger_mode', 'auto')
         self.declare_parameter('hand_wait_timeout_sec', 30.0)
-        # How long to wait for GraspNet + selection to deliver a grasp after
-        # the trigger (covers EgoHOS latency and the driver's retry attempts).
         self.declare_parameter('capture_timeout_sec', 15.0)
 
         # Arm / MoveIt
@@ -115,47 +86,27 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('grasp_epsilon_inner', 0.1)
         self.declare_parameter('grasp_epsilon_outer', 0.1)
 
-        # Predefined joint configurations
-        # HOME — safe resting pose, arm tucked and out of the way
         self.declare_parameter('home_joints', [
             -0.3017, -0.9131, -1.1905, -1.7694, -0.8113, 1.4376, 0.8624])
-        # DROPOFF — where the robot places the received object
         self.declare_parameter('dropoff_joints', [
             0.0761, 0.0087, 0.0108, -2.7316, -0.0448, 2.7889, 0.8629])
 
-        # Fingertip TCP offset — MoveIt places the panda_hand frame ORIGIN
-        # (hand base) at the goal, but the grip centre between the fingertip
-        # contacts sits this far along the hand's +Z (approach) axis. The
-        # commanded hand pose is backed off by this so the fingertips land
-        # exactly on the grasp point.
+        # Offset to align fingertips (not hand base) with grasp point.
         self.declare_parameter('hand_tcp_offset', 0.1034)
 
-        # Pre-grasp distance — the arm first moves to a pose backed off this
-        # far along the grasp's own approach axis (TCP -Z), then covers the
-        # remaining distance in a short, straight final approach.
+        # Distance backed off along approach axis for final straight approach.
         self.declare_parameter('pregrasp_distance', 0.10)
 
-        # If true, every arm motion is planned first and only executed after
-        # the user confirms with Enter (inspect the trajectory in RViz via the
-        # Planned Path display). Requires running this node in its own
-        # terminal so stdin is available — not under `ros2 launch`.
+        # Wait for user Enter to confirm planned motions (requires separate terminal).
         self.declare_parameter('confirm_before_execute', True)
 
-        # Minimum Z height (in planning frame) — safety floor to prevent
-        # the robot from going below the table surface.
+        # Safety floor to prevent collision with table.
         self.declare_parameter('min_grasp_z', 0.05)
 
-        # Offset applied to the final grasp pose, expressed in the TCP frame
-        # (metres): x across the fingers ('up' relative to them), y along the
-        # finger-closing axis, z along the approach axis (negative backs off).
-        # Applied after the anti-twist flip, so it follows the hand's actual
-        # orientation.
+        # TCP frame offset (xyz) applied after anti-twist flip.
         self.declare_parameter('grasp_offset_tcp', [-0.09, 0.0, -0.09])
 
-        # If true, override GraspNet's orientation so the approach is always
-        # straight down (world -Z). Only the grasp's yaw is kept: the
-        # finger-closing axis is projected onto the horizontal plane, so the
-        # fingers still line up with the object.
+        # Project finger-closing axis to horizontal for straight-down approach (preserves yaw).
         self.declare_parameter('force_top_down_grasp', True)
 
         self.declare_parameter('table_enable', True)
@@ -163,9 +114,7 @@ class HandoverOrchestrator(Node):
         self.declare_parameter('table_size', [1.2, 1.2, 0.05])
         self.declare_parameter('table_ignore_collision_links', ['panda_link1'])
 
-        # Release detection mode:
-        #   'timeout'  — wait a fixed duration then proceed (default, works now)
-        #   'force'    — monitor F/T sensor until weight drops (TODO)
+        # Release detection mode: 'timeout' or 'force' (TODO: F/T based).
         self.declare_parameter('release_detection_mode', 'timeout')
         self.declare_parameter('release_timeout_sec', 3.0)
 
@@ -193,7 +142,7 @@ class HandoverOrchestrator(Node):
         self._release_mode = self.get_parameter('release_detection_mode').value
         self._release_timeout = self.get_parameter('release_timeout_sec').value
 
-        self._require_stable_hand = self.get_parameter('require_stable_hand').value
+        self._trigger_mode = self.get_parameter('trigger_mode').value
         self._hand_wait_timeout = self.get_parameter('hand_wait_timeout_sec').value
         self._capture_timeout = self.get_parameter('capture_timeout_sec').value
 
@@ -217,11 +166,11 @@ class HandoverOrchestrator(Node):
         self._state = State.STARTUP
         self._sequence_confirmed = False
         self._target_grasp: PoseStamped | None = None
-        self._trigger_time: float | None = None  # Enter press, for trigger→grasp timing
+        self._trigger_time: float | None = None
         self._hand_status: str | None = None
         self._capture_lock = threading.Lock()
 
-        # Latched so late subscribers (UIs, other nodes) see the current state
+        # Latched for late subscribers
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self._state_pub = self.create_publisher(
             String, self.get_parameter('system_state_topic').value, state_qos)
@@ -229,8 +178,7 @@ class HandoverOrchestrator(Node):
         self._capture_trigger_pub = self.create_publisher(
             Empty, self.get_parameter('capture_trigger_topic').value, 1)
 
-        # Use a reentrant callback group so the subscription callback can
-        # fire while action clients are blocking in _run_handover
+        # Reentrant callback group allows subscriptions to fire during blocking actions.
         cb_group = ReentrantCallbackGroup()
         self._get_scene_client = self.create_client(
             GetPlanningScene, '/get_planning_scene', callback_group=cb_group)
@@ -257,7 +205,6 @@ class HandoverOrchestrator(Node):
         # Schedule the initial homing sequence to run shortly after startup
         self._startup_timer = self.create_timer(1.0, self._on_startup_timer, callback_group=cb_group)
 
-        # Operator console: Enter arms a capture whenever the state is IDLE
         self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
         self._input_thread.start()
 
@@ -285,37 +232,23 @@ class HandoverOrchestrator(Node):
                 continue
             _flush_stdin()
             try:
-                input('\nIDLE — press Enter to capture a grasp… ')
+                msg = '\nIDLE — press Enter to manual override and capture a grasp… ' if self._trigger_mode == 'auto' else '\nIDLE — press Enter to capture a grasp… '
+                input(msg)
             except EOFError:
                 return
             if self._state == State.IDLE:
-                self._run_capture()
+                self.get_logger().info('Manual trigger activated via terminal.')
+                threading.Thread(target=self._run_capture, daemon=True).start()
 
     def _run_capture(self) -> None:
-        """Arm one capture: optionally wait for a stable hand, trigger GraspNet,
-        then wait for the handover to take over (or time out back to IDLE)."""
         self._trigger_time = time.monotonic()
-        if self._require_stable_hand:
-            self._set_state(State.WAITING_FOR_HAND)
-            deadline = time.monotonic() + self._hand_wait_timeout
-            while time.monotonic() < deadline:
-                if self._hand_status == STATUS_STABLE:
-                    break
-                time.sleep(0.1)
-            else:
-                self.get_logger().warn(
-                    f'Hand not stable within {self._hand_wait_timeout:.0f}s '
-                    f'(last status: {self._hand_status}) — back to IDLE.')
-                self._set_state(State.IDLE)
-                return
-
         self._set_state(State.CAPTURING)
         self._capture_trigger_pub.publish(Empty())
 
         deadline = time.monotonic() + self._capture_timeout
         while time.monotonic() < deadline:
             if self._state != State.CAPTURING:
-                return  # a grasp arrived and the handover sequence took over
+                return
             time.sleep(0.2)
 
         with self._capture_lock:
@@ -328,9 +261,16 @@ class HandoverOrchestrator(Node):
     # Subscription callbacks
 
     def _on_hand_status(self, msg: String) -> None:
-        if msg.data != self._hand_status:
+        prev_status = self._hand_status
+        if msg.data != prev_status:
             self.get_logger().info(f'Hand status: {msg.data}')
         self._hand_status = msg.data
+        
+        # Auto trigger logic
+        if self._trigger_mode == 'auto' and self._state == State.IDLE:
+            if prev_status != STATUS_STABLE and self._hand_status == STATUS_STABLE:
+                self.get_logger().info('Hand is stable. Auto-triggering capture.')
+                threading.Thread(target=self._run_capture, daemon=True).start()
 
     def _on_selected_grasp(self, msg: PoseStamped) -> None:
         with self._capture_lock:
@@ -348,12 +288,6 @@ class HandoverOrchestrator(Node):
     # Main sequence
 
     def _run_handover(self) -> None:
-        """Execute the full handover state machine sequentially.
-
-        Each step blocks until its action completes.  On any failure the
-        sequence aborts and returns to IDLE so the robot doesn't continue
-        moving after an error.
-        """
         self._sequence_confirmed = False
         grasp_in_robot = self._transform_grasp()
         if grasp_in_robot is None:
@@ -375,17 +309,13 @@ class HandoverOrchestrator(Node):
             f'  approach_dir (Z-axis): ({approach_dir[0]:.3f}, {approach_dir[1]:.3f}, {approach_dir[2]:.3f})')
 
 
-        # TCP compensation: goal poses command the panda_hand frame origin
-        # (hand base), but the fingertip grip centre is hand_tcp_offset
-        # further along the approach axis. Back the hand pose off so the
-        # fingertips — not the hand base — land on the grasp point.
+        # Shift pose back so fingertips align with grasp point.
         hand_grasp = copy.deepcopy(grasp_in_robot)
         hand_grasp.pose.position.x -= approach_dir[0] * self._hand_tcp_offset
         hand_grasp.pose.position.y -= approach_dir[1] * self._hand_tcp_offset
         hand_grasp.pose.position.z -= approach_dir[2] * self._hand_tcp_offset
 
-        # Pre-grasp pose: backed off from the grasp along its approach axis,
-        # so the final segment is a short, predictable straight-in motion.
+        # Back off for straight-line final approach.
         pre_grasp = copy.deepcopy(hand_grasp)
         pre_grasp.pose.position.x -= approach_dir[0] * self._pregrasp_distance
         pre_grasp.pose.position.y -= approach_dir[1] * self._pregrasp_distance
@@ -475,7 +405,6 @@ class HandoverOrchestrator(Node):
     # Helpers
 
     def _add_table_to_scene(self) -> None:
-        """Insert the table as a collision box into the MoveIt planning scene."""
         if not self.get_parameter('table_enable').value:
             return
         position = list(self.get_parameter('table_position').value)
@@ -508,14 +437,7 @@ class HandoverOrchestrator(Node):
             self._allow_table_collisions(links)
 
     def _allow_table_collisions(self, links: list[str]) -> None:
-        """Allow contact between the table object and the given robot links.
-
-        SRDF disable_collisions pairs are validated against the URDF, so a
-        planning-scene object like 'table' can't be handled there — it has to
-        go into the allowed collision matrix at runtime. A PlanningScene diff
-        with a non-empty ACM replaces the whole matrix, so fetch the current
-        one from move_group, extend it, and publish it back.
-        """
+        """Injects the table object into the runtime allowed collision matrix (ACM) for the given links, bypassing URDF limitations."""
         if not self._get_scene_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn(
                 'get_planning_scene service unavailable — collisions between '
@@ -555,14 +477,7 @@ class HandoverOrchestrator(Node):
             f'Allowed collisions between the table and {links}.')
 
     def _confirm(self, label: str):
-        """Build a confirmation callback for ArmClient, or None if disabled.
-
-        The callback blocks on stdin after planning succeeds, so the planned
-        trajectory can be inspected in RViz (Planned Path display) before the
-        robot moves.  Only the first segment of a sequence prompts: confirming
-        it sets _sequence_confirmed, and later segments execute without asking
-        (the flag is reset at the start of each handover).
-        """
+        """Blocks on stdin to allow RViz trajectory inspection before execution. Only prompts on the first segment."""
         if not self._confirm_before_execute:
             return None
 
@@ -581,7 +496,7 @@ class HandoverOrchestrator(Node):
         return _ask
 
     def _final_approach(self, grasp_pose: PoseStamped) -> bool:
-        """Move from pre-grasp onto the grasp, preferring a straight-line motion."""
+        """Prefer straight-line (LIN) motion for the final approach, falling back to joint-space (PTP)."""
         if self._arm.move_to_pose(grasp_pose, planner_id='LIN',
                                   confirm=self._confirm('final approach (LIN)')):
             return True
@@ -590,7 +505,6 @@ class HandoverOrchestrator(Node):
                                       confirm=self._confirm('final approach (PTP)'))
 
     def _transition(self, state: State, action) -> bool:
-        """Move to *state*, execute *action*; return True on success, False on failure."""
         self._set_state(state)
         success = action()
         if not success:
@@ -620,10 +534,7 @@ class HandoverOrchestrator(Node):
             transformed = self._tf_buffer.transform(
                 self._target_grasp, self._planning_frame, timeout=rclpy.duration.Duration(seconds=2))
             
-            # Prevent the robot arm from wrapping around 360 degrees or twisting awkwardly:
-            # We check if the Franka Hand's X-axis (which points 'up' relative to the fingers)
-            # is pointing downwards in the robot's base frame (Z < 0).
-            # If so, we rotate the grasp 180 degrees around the approach axis (Z-axis).
+            # Flip grasp 180° around approach axis if hand's "up" vector points down to prevent wrist twist.
             from scipy.spatial.transform import Rotation
             q = [
                 transformed.pose.orientation.x,
@@ -661,13 +572,7 @@ class HandoverOrchestrator(Node):
             return None
 
     def _force_top_down_orientation(self, pose: Pose) -> None:
-        """Replace the orientation so the approach axis points straight down.
-
-        Keeps only the grasp's yaw: the finger-closing axis (TCP y) is
-        projected onto the horizontal plane, so the fingers stay aligned with
-        the object while the hand comes in vertically. Falls back to world y
-        if the closing axis was near-vertical (projection degenerate).
-        """
+        """Projects the finger-closing axis onto the horizontal plane to force a vertical approach while maintaining yaw alignment."""
         import numpy as np
         from scipy.spatial.transform import Rotation
         q = pose.orientation
@@ -684,7 +589,7 @@ class HandoverOrchestrator(Node):
         self.get_logger().info('Forced top-down grasp orientation (yaw kept).')
 
     def _apply_grasp_offset(self, pose: Pose) -> None:
-        """Shift *pose* by grasp_offset_tcp, expressed in the pose's own frame."""
+        """Applies a translational offset in the TCP frame (post-rotation) for fine-tuning grasp depth/centering."""
         offset = self._grasp_offset_tcp
         if not any(offset):
             return
@@ -700,33 +605,14 @@ class HandoverOrchestrator(Node):
 
     @staticmethod
     def _get_approach_direction(orientation):
-        """Extract the Z-axis (approach direction) from a quaternion.
-
-        Returns the third column of the rotation matrix encoded by the
-        quaternion — the gripper approach axis in the planning frame.
-        """
         rot = Rotation.from_quat(
             [orientation.x, orientation.y, orientation.z, orientation.w])
         return rot.as_matrix()[:, 2]
 
     def _wait_for_release(self) -> bool:
-        """Wait until the human releases the object.
-
-        Current modes:
-        - 'timeout': simply wait a fixed duration (works out of the box).
-
-        Future mode:
-        - 'force': subscribe to the Panda's F/T sensor (external torque
-          estimates from ``/franka_robot_state_broadcaster/robot_state``)
-          and wait until the sensed load drops below a threshold,
-          indicating the human has let go.  This avoids the robot yanking
-          the object away before the human is ready.
-        """
+        """Waits for the user to release the object via timeout or F/T sensor load drop."""
         if self._release_mode == 'force':
             # TODO: implement F/T-based release detection
-            #   1. Subscribe to robot state topic for external torques
-            #   2. Wait until external force magnitude drops below threshold
-            #   3. Return True when released, False on timeout
             self.get_logger().warn(
                 "release_detection_mode='force' is not yet implemented — "
                 "falling back to timeout")
@@ -740,8 +626,7 @@ class HandoverOrchestrator(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = HandoverOrchestrator()
-    # MultiThreadedExecutor so subscription callback can fire while
-    # _run_handover blocks on action results
+    # MultiThreadedExecutor allows subscription callbacks during blocking action results.
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:

@@ -1,15 +1,4 @@
-"""Grasp selection node.
-
-Subscribes to the scored grasp candidates from GraspNet and applies a
-configurable selection policy to pick the single best grasp, published as
-a PoseStamped for the orchestrator to act on.
-
-The selected pose is republished unchanged (position + orientation) in the
-camera frame; the orchestrator transforms it into the planning frame via TF.
-The only frame handling here is an optional frame_id override used to route
-the pose through the calibration-correction frame published in
-handover.launch.xml, instead of baking that correction into the pose values.
-"""
+"""Grasp selection node."""
 
 from functools import partial
 
@@ -32,18 +21,9 @@ class GraspSelectionNode(Node):
         self.declare_parameter('input_topic', 'grasp_candidates')
         self.declare_parameter('output_topic', 'selected_grasp')
         self.declare_parameter('policy', 'highest_score')
-        # 'top_down' policy only: maximum tilt (degrees) of the approach axis
-        # from straight-down in panda_link0, and whether candidates outside
-        # that cone are rejected outright (strict) or the most downward-
-        # pointing one is used as a fallback (non-strict, old behaviour).
         self.declare_parameter('top_down_max_tilt_deg', 45.0)
         self.declare_parameter('top_down_strict', True)
-        # 'ergonomic' policy only: 3-D hand centroid published by the GraspNet
-        # driver (same camera frame and header stamp as the candidates).
         self.declare_parameter('hand_center_topic', 'hand_center')
-        # If non-empty, replaces the frame_id on the published pose. Used to
-        # stamp poses with the calibration-correction frame from
-        # handover.launch.xml; set to '' once the camera is recalibrated.
         self.declare_parameter('output_frame', 'camera_color_optical_corrected')
 
         policy_name = self.get_parameter('policy').value
@@ -83,11 +63,7 @@ class GraspSelectionNode(Node):
         self._last_hand_center = msg
 
     def _fresh_hand_center(self, stamp):
-        """Hand centroid matching this inference's stamp, or None.
-
-        The driver publishes the centroid right before the candidates with
-        the same header stamp, so a mismatch means the hand was not visible
-        in this inference (or the cached point is from an older capture)."""
+        """Validate cached hand centroid matches current inference timestamp to avoid stale data."""
         hc = self._last_hand_center
         if hc is None or hc.header.stamp != stamp:
             return None
@@ -105,8 +81,7 @@ class GraspSelectionNode(Node):
             kwargs['hand_center'] = self._fresh_hand_center(msg.header.stamp)
 
         idx = self._policy(msg.poses, frame_id, self._tf_buffer, **kwargs)
-        # ergonomic returns (index, debug string) — log the string from this
-        # node so it lands in its console output and /rosout.
+
         if isinstance(idx, tuple):
             idx, debug = idx
             if debug:

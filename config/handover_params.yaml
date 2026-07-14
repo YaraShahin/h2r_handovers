@@ -1,77 +1,49 @@
-#  Grasp Selection
 grasp_selection_node:
   ros__parameters:
     input_topic: "grasp_candidates"
     output_topic: "selected_grasp"
-    # Available policies: highest_score, top_down, nearest_depth,
-    # top_k_aligned, ergonomic.
-    # ergonomic: hybrid score / hand-clearance — reports the highest-score
-    # grasp and the grasp furthest from the hand centre (published by the
-    # GraspNet driver on 'hand_center') plus the distance between the two,
-    # and picks the max-clearance one. Falls back to highest_score when the
-    # hand is not visible.
-    # top_down: best-scored grasp whose approach axis is within
-    # top_down_max_tilt_deg of straight down in panda_link0.
+    
+    # Options: highest_score, top_down, nearest_depth, top_k_aligned, ergonomic
     policy: "ergonomic"
-    # Maximum tilt (degrees) from vertical for the top_down policy.
+    
     top_down_max_tilt_deg: 30.0
-    # true  — candidates outside the cone are rejected; if none qualifies,
-    #         nothing is published and the capture times out back to IDLE.
-    # false — the most downward-pointing candidate is used as a fallback,
-    #         so a sideways-only presentation still yields a grasp.
     top_down_strict: false
-    # Poses are stamped in this frame — the calibration-correction frame
-    # published in handover.launch.xml. Set to "" (keep the camera frame)
-    # after recalibrating the camera extrinsics.
+    
+    # defaults to camera frame
     output_frame: "camera_color_optical_corrected"
 
-#  Handover Orchestrator
 handover_orchestrator:
   ros__parameters:
     selected_grasp_topic: "selected_grasp"
-
-    # Capture — Enter in the orchestrator terminal arms one capture.
     capture_trigger_topic: "capture_trigger"
     hand_status_topic: "hand_stability_status"
     system_state_topic: "system_state"
-    # If true, an armed capture waits for 'hand_stable' before triggering
-    # GraspNet (requires hand_stabilization_node to be running).
-    require_stable_hand: false
+    
+    # 'auto' (hand stability) or 'manual' (Enter key)
+    trigger_mode: "auto"
     hand_wait_timeout_sec: 30.0
-    # How long to wait for a selected grasp after the trigger (covers EgoHOS
-    # latency and the GraspNet driver's retry attempts).
+    
     capture_timeout_sec: 15.0
-    # MoveIt / Arm
+    
     planning_group: "panda_arm"
     planning_frame: "panda_link0"
-    # Goal poses command the panda_hand frame (hand base). The fingertip
-    # TCP is compensated explicitly via hand_tcp_offset below — do NOT set
-    # this to panda_hand_tcp (not confirmed to exist in the SRDF), or the
-    # offset would be applied twice.
     ee_link: "panda_hand"
-    # Kept low for early hardware tests — raise (e.g. 0.2) once the
-    # calibration and grasp poses are trusted.
+    
     max_velocity_scaling: 0.2
     max_acceleration_scaling: 0.1
     planning_time: 5.0
 
-    # Plan first, execute only after Enter is pressed in the orchestrator
-    # terminal (inspect the Planned Path in RViz). Requires running the
-    # orchestrator in its own terminal, not under `ros2 launch`.
+    # Requires orchestrator terminal
     confirm_before_execute: true
 
-    # Gripper
-    gripper_open_width: 0.08          # metres — fully open
-    gripper_open_speed: 0.1           # m/s
-    grasp_width: 0.0                  # metres — how far to close
-    grasp_speed: 0.03                 # m/s — closing speed
-    grasp_force: 40.0                 # Newtons — grasping force
-    grasp_epsilon_inner: 0.1          # metres — inner tolerance
-    grasp_epsilon_outer: 0.1          # metres — outer tolerance
+    gripper_open_width: 0.08
+    gripper_open_speed: 0.1
+    grasp_width: 0.0
+    grasp_speed: 0.03
+    grasp_force: 40.0
+    grasp_epsilon_inner: 0.1
+    grasp_epsilon_outer: 0.1
 
-    # Predefined joint configurations (7-DOF, radians)
-    # HOME: safe resting pose — arm is tucked and out of the way,
-    #        ready to start a new handover.
     home_joints:
       - 0.02339568794756837
       - -0.32465551723001435
@@ -81,8 +53,6 @@ handover_orchestrator:
       - 2.293500571313975
       - 0.7461003649698391
 
-
-    # DROPOFF: where the robot moves to place the received object.
     dropoff_joints:
       - 0.0761
       - 0.0087
@@ -92,43 +62,19 @@ handover_orchestrator:
       - 2.7889
       - 0.8629
 
-    # Approach
-    # Fingertip TCP offset (metres): the panda_hand frame origin sits at the
-    # hand base; the grip centre between the fingertip contacts is this far
-    # along the hand's +Z (approach) axis. The commanded hand pose is backed
-    # off by this so the fingertips land exactly on the grasp point.
     hand_tcp_offset: 0.1034
-    # The arm first moves to a pre-grasp pose backed off this far along the
-    # grasp's approach axis (TCP -Z), then does a short straight final approach.
     pregrasp_distance: 0.10
 
-    # Safety floor: minimum Z height in planning frame.
-    # Prevents the robot from going below the table surface.
     min_grasp_z: 0.0
 
-    # Offset applied to the final grasp pose, expressed in the TCP frame
-    # (metres): x across the fingers ('up' relative to them), y along the
-    # finger-closing axis, z along the approach axis (negative backs off).
-    # t 1: y & z need more pos
-    # t 2: x & z need more pos
-    # t 3: just z more pos
-    # t 4: 
     grasp_offset_tcp: [0.035, -0.09, 0.03]
 
-    # Override GraspNet's orientation so the approach is always straight down
-    # (world -Z), keeping only the yaw so the fingers stay aligned with the
-    # object. With this on, TCP -z in grasp_offset_tcp means straight up.
+    # Orient downwards regardless of prediction
     force_top_down_grasp: true
 
-    # Table collision box (added to the MoveIt planning scene at startup so
-    # planned paths can't sweep through the table). Centre and size in
-    # panda_link0, metres; top surface sits 6 cm below the mounting plane.
     table_enable: false
     table_position: [0.4, 0.0, -0.1]
     table_size: [1.2, 1.2, 0.05]
 
-    # Release detection
-    # 'timeout' — wait a fixed duration before retreating (works now)
-    # 'force'   — monitor Panda F/T sensor until human releases (TODO)
     release_detection_mode: "timeout"
     release_timeout_sec: 3.0

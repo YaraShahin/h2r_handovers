@@ -1,15 +1,4 @@
-"""Helper action clients for the Franka Panda arm and gripper.
-
-Each class is constructed with a reference to the parent ``rclpy.Node`` so it
-can create action clients, log messages, and spin futures without owning its
-own node.  This keeps the orchestrator focused on state-machine logic.
-
-Robot interfaces used (all standard Bosch franka_ros2 / MoveIt 2):
-
-* ``moveit_msgs/action/MoveGroup``     →  ``/move_action``
-* ``franka_msgs/action/Move``          →  ``/panda_gripper/move``
-* ``franka_msgs/action/Grasp``         →  ``/panda_gripper/grasp``
-"""
+"""Helper action clients for the Franka Panda arm and gripper."""
 
 from __future__ import annotations
 
@@ -43,14 +32,7 @@ def _wait_future(future):
     event.wait()
     return future.result()
 
-
-
-
-# MoveIt 2 MoveGroup action client wrapper
 class ArmClient:
-    """Thin wrapper around the ``/move_action`` MoveGroup action server."""
-
-    # Default joint names for the 7-DOF Panda arm
     JOINT_NAMES = [
         'panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
         'panda_joint5', 'panda_joint6', 'panda_joint7',
@@ -94,15 +76,10 @@ class ArmClient:
 
     def move_to_pose(self, pose_stamped: PoseStamped, planner_id: str = 'PTP',
                      confirm: Callable[[], bool] | None = None) -> bool:
-        """Plan and execute to a Cartesian pose goal.  Blocks until done.
 
-        If *confirm* is given, it is called after planning succeeds (the planned
-        trajectory is visible in RViz at that point); execution only proceeds
-        if it returns True.
-        """
         request = self._base_request(planner_id=planner_id)
 
-        # Position constraint — a tiny sphere around the target
+        # Position constraint
         pc = PositionConstraint()
         pc.header = pose_stamped.header
         pc.link_name = self._ee_link
@@ -169,12 +146,6 @@ class ArmClient:
 
     def _plan_then_execute(self, request: MotionPlanRequest, label: str,
                            confirm: Callable[[], bool] | None = None) -> bool:
-        """Plan the motion, optionally wait for confirmation, then execute it.
-
-        Planning and execution are two separate MoveIt actions so the planned
-        trajectory can be inspected in RViz (move_group publishes it on
-        /display_planned_path) before the robot moves.
-        """
         goal = MoveGroup.Goal()
         goal.request = request
         goal.planning_options = PlanningOptions()
@@ -214,10 +185,7 @@ class ArmClient:
         return False
 
 
-# Franka gripper action servers wrapper
 class GripperClient:
-    """Thin wrapper around ``/panda_gripper/move`` and ``/panda_gripper/grasp``."""
-
     def __init__(
         self,
         node: Node,
@@ -237,7 +205,6 @@ class GripperClient:
         node.get_logger().info('GripperClient: connected')
 
     def open(self, width: float = 0.08, speed: float = 0.1) -> bool:
-        """Open the gripper to *width* metres at *speed* m/s."""
         goal = MoveAction.Goal()
         goal.width = width
         goal.speed = speed
@@ -251,7 +218,6 @@ class GripperClient:
         epsilon_inner: float = 0.005,
         epsilon_outer: float = 0.005,
     ) -> bool:
-        """Close the gripper on an object with the given force."""
         goal = GraspAction.Goal()
         goal.width = width
         goal.speed = speed

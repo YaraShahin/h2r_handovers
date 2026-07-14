@@ -21,29 +21,17 @@
     <arg name="robot_ip" value="172.16.0.2"/>
   </include>
 
-  <!-- <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/> -->
+  <node pkg="h2r_handovers" exec="hand_stabilization_node" name="hand_stabilization_node" output="screen"/>
 
   <node pkg="h2r_handovers" exec="grasp_selection_node" name="grasp_selection_node" output="screen">
     <param from="$(find-pkg-share h2r_handovers)/config/handover_params.yaml" />
   </node>
 
-  <!-- handover_orchestrator is the operator console: Enter to capture a
-       grasp, Enter to confirm each planned motion. It needs terminal input,
-       which a launch file does not forward — run it in its own terminal.
-       See the usage section in graspnet-baseline/README.md. -->
-
-  <!-- Camera Calibration Static TFs (from panda_hand to camera_link) -->
+  <!-- Camera Calibration -->
   <node pkg="tf2_ros" exec="static_transform_publisher" name="hand_to_cameraTemp"
         args="0.07085917397 0.03292617131 0.05131155109 -0.00814520629 0.0006262179598 -0.7175730906 0.6964352971 panda_hand camera_link_temp" />
   <node pkg="tf2_ros" exec="static_transform_publisher" name="cameraTemp_to_camera"
         args="0.015 0.001 0 0.5 -0.5 0.5 0.5 camera_link_temp camera_link" />
-
-  <!-- Calibration correction: the calibrated extrinsics above are rotated
-       180 deg about the camera optical Z axis (grasp positions came out
-       mirrored in X/Y, previously patched by negating x/y in code).
-       Grasp poses are stamped in this corrected frame instead.
-       After recalibrating the camera, delete this node and set
-       grasp_selection_node's 'output_frame' parameter to ''. -->
   <node pkg="tf2_ros" exec="static_transform_publisher" name="optical_mirror_correction"
         args="0 0 0 0 0 1 0 camera_color_optical_frame camera_color_optical_corrected" />
 </launch>

@@ -56,8 +56,7 @@ class HandStabilizationNode(Node):
         ys, xs = np.nonzero(mask == self._hand_label)
 
         if xs.size < self._min_hand_pixels:
-            # Hand lost: stale history would otherwise be stitched to a
-            # reappearance at a different location, so drop it.
+            # Drop stale history on hand loss to avoid jumping
             self._history.clear()
             self._publish_status(STATUS_NO_HAND)
             return
@@ -78,9 +77,7 @@ class HandStabilizationNode(Node):
         return STATUS_STABLE if max_dist <= self._position_tolerance_px else STATUS_UNSTABLE
 
     def _publish_status(self, status: str) -> None:
-        # Edge-triggered: only emit a message when the status actually changes,
-        # so consumers see exactly one "hand_stable" / "hand_unstable" / "no_hand"
-        # event per transition instead of a continuous stream.
+        # Publish only on status change
         if status == self._last_status:
             return
         self._last_status = status

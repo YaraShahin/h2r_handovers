@@ -2,103 +2,98 @@
 
 Human-to-Robot handover pipeline for the Franka Emika Panda, built on ROS 2 Humble.
 
-A human holds out an object → the system segments the hand and object ([EgoHOS](https://github.com/YaraShahin/EgoHOS)), generates grasp candidates ([GraspNet](https://github.com/YaraShahin/graspnet-baseline)), selects the best grasp, and commands the robot to take the object.
+A human holds out an object, the system segments the hand and object using [EgoHOS](https://github.com/YaraShahin/EgoHOS), generates grasp candidates with [GraspNet](https://github.com/YaraShahin/graspnet-baseline), selects the optimal grasp via configurable policies, and safely commands the robot to take the object.
 
 ## Architecture
 
+The system is composed of a perception pipeline that processes RGB-D data to understand the scene, and a planning and control pipeline that orchestrates the robot's motion. The architecture relies on isolated virtual environments for deep learning models to prevent dependency conflicts, communicating via ROS 2 topics.
+
+```mermaid
+flowchart TD
+    subgraph Sensors
+        Cam["RealSense D435"]
+    end
+
+    subgraph Perception ["Perception Pipeline"]
+        EgoHOS["EgoHOS Node (egohos_venv)"]
+        GraspNet["GraspNet Node (graspnet_venv)"]
+        HandStab["Hand Stabilization Node"]
+    end
+
+    subgraph Planning ["Planning & Control"]
+        GraspSel["Grasp Selection Node"]
+        Orchestrator["Handover Orchestrator"]
+        MoveIt["MoveIt 2 / Franka Control"]
+    end
+
+    Cam -->|"RGB Image"| EgoHOS
+    Cam -->|"Depth & CameraInfo"| GraspNet
+
+    EgoHOS -->|"Segmentation Mask"| HandStab
+    EgoHOS -->|"Segmentation Mask"| GraspNet
+
+    HandStab -->|"Stability Status"| Orchestrator
+    
+    Orchestrator -->|"Capture Trigger"| GraspNet
+    GraspNet -->|"Grasp Candidates (PoseArray)"| GraspSel
+    
+    GraspSel -->|"Selected Grasp (PoseStamped)"| Orchestrator
+    
+    Orchestrator -->|"Joint/Pose Goals"| MoveIt
 ```
-RealSense D435 (640×480 @ 30fps)
-       │
-       ├─ /camera/.../color/image_raw ──────► EgoHOS Node (egohos_venv)
-       │                                         │
-       │                                         ├─ segmentation_mask ──► Hand Stabilization Node
-       │                                         │                              │
-       │                                         │                         hand_stability_status
-       │                                         │                              │
-       ├─ /camera/.../aligned_depth_to_color ────┼──────────────────────► GraspNet Node (graspnet_venv)
-       │                                         │                              │
-       └─ /camera/.../camera_info ───────────────┘                        grasp_candidates (PoseArray)
-                                                                                │
-                                                                         [Grasp Selection — TBD]
-                                                                                │
-                                                                         [Handover Orchestrator — TBD]
-                                                                                │
-                                                                          MoveIt / Franka ROS2
-```
 
-### Nodes
+### Core Components
 
-| Node | Package / Location | What it does |
-|------|--------------------|-------------|
-| **egohos_node** | `EgoHOS/scripts/driver.py` (own venv) | Subscribes to RGB, runs 3-stage segmentation cascade (hands → contact boundary → object), publishes `segmentation_mask` (mono8: 0=bg, 1=hand, 2=object) and optional colour overlay |
-| **hand_stabilization_node** | `h2r_handovers` | Tracks hand centroid in the segmentation mask; publishes edge-triggered status (`hand_stable` / `hand_unstable` / `no_hand`). Note: Only used for initial grasp triggering, not during approach since hand cannot be detected well during movement due to camera angle change. |
-| **graspnet_node** | `graspnet-baseline/scripts/driver.py` (own venv) | Waits for `hand_stable`, time-syncs mask + depth + CameraInfo, builds object point cloud, runs GraspNet, publishes scored `PoseArray` + debug image |
-| **grasp_selection_node** | *TBD* | Choose best grasp from candidates (depth heuristic, comfort-aware, etc.) |
-| **handover_orchestrator** | *TBD* | State machine: wait → approach → grip → detect release (F/T) → retract |
+#### 1. Perception Pipeline
+- **EgoHOS Node (`EgoHOS/scripts/driver.py`)**: Runs in a dedicated virtual environment (`egohos_venv`). It subscribes to the RGB image stream and uses a 3-stage cascaded segmentation model to identify hands, contact boundaries, and objects. It outputs a `segmentation_mask` where pixels are labeled as background (0), hand (1), or object (2).
+- **Hand Stabilization Node (`h2r_handovers`)**: Analyzes the `segmentation_mask` over time. It calculates the centroid of the hand and tracks its movement. Once the hand remains within a defined pixel tolerance for a specific number of frames, it publishes a `hand_stable` status to trigger the handover. It acts as the intent-recognition trigger for the system.
+- **GraspNet Node (`graspnet-baseline/scripts/driver.py`)**: Runs in its own isolated environment (`graspnet_venv`). It waits for a capture trigger from the orchestrator. Once triggered, it synchronizes the latest RGB mask, aligned depth image, and camera intrinsics. It masks out the human hand and background, generates a 3D point cloud of the object, and infers a dense set of 6-DOF grasp poses using GraspNet-1B. It publishes these as a scored `PoseArray`.
 
-### Topics
+#### 2. Planning & Control
+- **Grasp Selection Node (`h2r_handovers`)**: Subscribes to the raw array of grasp candidates generated by GraspNet. It applies configurable policies (e.g., `ergonomic`, `highest_score`, `top_down`, `nearest_depth`) to filter and select the single most appropriate grasp for the situation. It then publishes this as a `selected_grasp`.
+- **Handover Orchestrator (`h2r_handovers`)**: The central state machine of the system. It governs the high-level logic:
+  - Monitors hand stability to auto-trigger captures.
+  - Receives the selected grasp and transforms it into the robot's planning frame.
+  - Sequences the Franka Panda through the physical handover: opening the gripper, moving to a pre-grasp pose, performing a linear final approach, closing the gripper, waiting for the human to release, and finally retreating to a safe drop-off location.
+- **MoveIt / Franka ROS 2**: Handles the low-level kinematics, trajectory generation, and collision avoidance (including a defined table collision object). The orchestrator interfaces with these via Action servers.
 
-| Topic | Type | Publisher | Subscriber(s) |
-|-------|------|-----------|---------------|
-| `/camera/camera/color/image_raw` | `sensor_msgs/Image` | RealSense | egohos_node, graspnet_node (debug) |
-| `/camera/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | RealSense | graspnet_node |
-| `/camera/camera/aligned_depth_to_color/camera_info` | `sensor_msgs/CameraInfo` | RealSense | graspnet_node |
-| `segmentation_mask` | `sensor_msgs/Image` (mono8) | egohos_node | hand_stabilization_node, graspnet_node |
-| `segmentation_overlay` | `sensor_msgs/Image` (bgr8) | egohos_node | RViz2 |
-| `hand_stability_status` | `std_msgs/String` | hand_stabilization_node | graspnet_node |
-| `grasp_candidates` | `geometry_msgs/PoseArray` | graspnet_node | *(selection node — TBD)* |
-| `grasp_debug_image` | `sensor_msgs/Image` (bgr8) | graspnet_node | RViz2 |
+---
+
+## Trigger Modes
+
+The pipeline behavior is controlled by the `trigger_mode` parameter in `config/handover_params.yaml`:
+
+- **Auto Mode (`"auto"`) - Default**: The orchestrator constantly monitors the `hand_stability_status` topic. When a stable hand is detected, it automatically fires the capture sequence to process the handover. You can still manually press `Enter` in the terminal to force a capture.
+- **Manual Mode (`"manual"`)**: The system waits for the operator to press `Enter` in the orchestrator terminal before initiating the capture sequence.
+
+---
 
 ## Workspace Setup
 
 ### Prerequisites
-
 - Ubuntu 22.04 + RT kernel
 - ROS 2 Humble
 - CUDA ≥ 11.3
 - Franka FCI firmware 4.2.2 / libfranka 0.9.2 (LCAS fork)
 
-### Clone the workspace
-
+### 1. Clone the Workspace
 ```bash
 mkdir -p ~/handover_ws/src && cd ~/handover_ws/src
-
-# This repo
 git clone https://github.com/<your-org>/h2r_handovers.git
-
-# External deps (franka_ros2, EgoHOS, graspnet-baseline)
 vcs import < h2r_handovers/humble.repos
 ```
 
-The resulting layout:
-
-```
-handover_ws/
-└── src/
-    ├── EgoHOS/                 # segmentation — pip -e into egohos_venv; add COLCON_IGNORE
-    ├── graspnet-baseline/      # grasping    — pip -e into graspnet_venv; add COLCON_IGNORE
-    ├── franka_ros2/            # robot drivers + MoveIt config
-    └── h2r_handovers/          # this repo — handover nodes, launch, config
-```
-
-### Install EgoHOS
-
-1. Create a venv with system-site-packages (so `rclpy` is importable):
-
+### 2. Install EgoHOS (Segmentation)
+The EgoHOS node requires its own isolated virtual environment to avoid dependency conflicts.
 ```bash
 cd ~/handover_ws/src
 python3 -m venv --system-site-packages egohos_venv
 source egohos_venv/bin/activate
-```
-
-2. Install EgoHOS dependencies:
-
-```bash
 cd EgoHOS
 pip install -r requirements.txt
 ```
 
-3. Verify PyTorch + CUDA:
+Verify PyTorch + CUDA:
 
 ```bash
 python -c "import torch; print(torch.__version__); x=torch.rand(3).cuda(); print(x+1)"
@@ -110,7 +105,7 @@ python -c "import torch; print(torch.__version__); x=torch.rand(3).cuda(); print
 >     --extra-index-url https://download.pytorch.org/whl/cu113
 > ```
 
-4. Install MMSegmentation:
+Install MMSegmentation:
 
 ```bash
 pip install -U openmim
@@ -124,13 +119,13 @@ pip install -v -e .
 > pip install mmcv-full==1.6.0 -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.11.0/index.html
 > ```
 
-5. Verify mmcv:
+Verify mmcv:
 
 ```bash
 python -c "import mmcv; from mmcv.ops import nms; print(mmcv.__version__)"
 ```
 
-6. Download model weights and test data:
+Download model weights and test data:
 
 ```bash
 cd ~/handover_ws/src/EgoHOS
@@ -139,189 +134,79 @@ bash download_datasets.sh    # optional, for offline testing
 bash download_testimages.sh  # optional, for offline testing
 ```
 
-7. Mark as COLCON_IGNORE:
+Mark as COLCON_IGNORE:
 
 ```bash
 touch ~/handover_ws/src/EgoHOS/COLCON_IGNORE
 ```
 
-### Install GraspNet
-
-1. Create a separate venv:
-
+### 3. Install GraspNet (Grasp Synthesis)
+GraspNet also runs in a dedicated virtual environment.
 ```bash
 cd ~/handover_ws/src
 python3 -m venv --system-site-packages graspnet_venv
 source graspnet_venv/bin/activate
-```
-
-2. Install dependencies:
-
-```bash
 cd graspnet-baseline
 pip install -r requirements.txt
-
-# Install custom CUDA ops
 cd pointnet2 && python setup.py install && cd ..
 cd knn && python setup.py install && cd ..
-
-# Install graspnetAPI
 pip install graspnetAPI
 ```
 
-3. Install PyTorch matching your CUDA:
+Install PyTorch matching your CUDA:
 
 ```bash
 pip install torch torchvision torchaudio \
     --extra-index-url https://download.pytorch.org/whl/cu118  # adjust for your CUDA
 ```
 
-4. Download pretrained checkpoint (`checkpoint-rs.tar` — RealSense model):
+Download pretrained checkpoint (`checkpoint-rs.tar` for RealSense model):
 
 ```
 Place at: graspnet-baseline/logs/log_rs/checkpoint.tar
 ```
 
-5. Mark as COLCON_IGNORE:
+Mark as COLCON_IGNORE:
 
 ```bash
 touch ~/handover_ws/src/graspnet-baseline/COLCON_IGNORE
 ```
 
-### Build the ROS 2 workspace
-
+### 4. Build the ROS 2 Workspace
 ```bash
 cd ~/handover_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
 
-## Quick Start
+---
 
-### 1. Verify robot movement (no vision)
+## Running the Pipeline
 
-```bash
-ros2 launch franka_moveit_config moveit.launch.py robot_ip:=172.16.0.2
-```
+Running the full handover system requires launching the core ROS 2 orchestrator and the two Python-based driver nodes in separate terminals to maintain their virtual environments.
 
-### 2. Verify EgoHOS segmentation (offline)
-
-```bash
-source ~/handover_ws/src/egohos_venv/bin/activate
-cd ~/handover_ws/src/EgoHOS/mmsegmentation
-bash pred_all_obj1.sh
-# Check output in ../testimages/pred_obj1_vis/
-```
-
-### 3. Launch the handover pipeline
-
-Terminal 1 — Camera + hand stabilization + RViz:
+### Terminal 1: Orchestrator & ROS 2 Pipeline
+Starts the Realsense camera, hand stabilization, MoveIt, and the main handover state machine.
 ```bash
 source ~/handover_ws/install/setup.bash
 ros2 launch h2r_handovers handover.launch.xml
 ```
 
-Terminal 2 — EgoHOS node (in its venv):
+### Terminal 2: EgoHOS Driver
+Runs the semantic segmentation network.
 ```bash
 source ~/handover_ws/src/egohos_venv/bin/activate
 python ~/handover_ws/src/EgoHOS/scripts/driver.py
 ```
 
-Terminal 3 — GraspNet node (in its venv):
+### Terminal 3: GraspNet Driver
+Runs the 3D grasp pose synthesis network.
 ```bash
 source ~/handover_ws/src/graspnet_venv/bin/activate
 python ~/handover_ws/src/graspnet-baseline/scripts/driver.py
 ```
 
-### 4. Debug / Visualize
-
-In RViz2, add Image displays for:
-- `segmentation_overlay` — see EgoHOS output
-- `grasp_debug_image` — see GraspNet grasp candidates projected onto the image
-
-Monitor hand stability:
-```bash
-ros2 topic echo hand_stability_status
-```
-
-Monitor grasp candidates:
-```bash
-ros2 topic echo grasp_candidates
-```
-
-## Implementation Roadmap
-
-- [x] Install & verify EgoHOS
-- [x] Install & verify GraspNet
-- [x] Install & verify RealSense
-- [x] Integrate RealSense + EgoHOS as ROS 2 nodes with launch and topics
-- [x] Add GraspNet as ROS 2 node
-- [x] Add hand stabilization (intention detection via centroid tracking)
-- [x] Add grasp selection node with pluggable policies
-- [x] Add handover orchestrator with MoveIt planning & execution
-- [x] Finalize full pipeline launch, docs, and configs
-- [ ] Add proper grasping with F/T release detection
-- [ ] End-to-end testing
-- [ ] Design user study (with/without selection criteria and grasp sensing)
-- [ ] Run user study
-
----
-
-## Archived Notes
-
-> The following are original working notes kept for reference.
-
-### Original repo structure plan
-
-```
-handover_ws/
-└── src/
-    ├── EgoHOS/                    # your fork — pip -e into egohos_venv;  add COLCON_IGNORE
-    ├── graspnet-baseline/         # your fork — pip -e into graspnet_venv; add COLCON_IGNORE
-    ├── franka_ros2/               # external — drivers, controllers, moveit config
-    ├── moveit_servo/              # external (or apt: ros-humble-moveit-servo → omit from src)
-    └── handover/                  # your NEW repo (one git repo, two packages)
-        ├── handover_interfaces/   # ament_cmake — custom msgs
-        │   ├── msg/
-        │   │   ├── GraspCandidate.msg
-        │   │   ├── GraspCandidates.msg
-        │   │   └── SelectedGrasp.msg
-        │   ├── CMakeLists.txt
-        │   └── package.xml
-        └── handover/              # ament_python — nodes, policies, launch, config
-            ├── handover/
-            │   ├── egohos_node.py
-            │   ├── graspnet_node.py
-            │   ├── grasp_selection_node.py
-            │   ├── handover_orchestrator.py
-            │   └── policies/      # depth_heuristic.py, comfort_aware.py (your ablation seam)
-            ├── launch/handover.launch.py
-            ├── config/servo_params.yaml
-            ├── setup.py
-            └── package.xml
-```
-
-### Original implementation step notes
-
-```
-2. install & verify graspnet
-3. install & verify realsense
-
-4. integrate realsense & egohos and their launch and interfaces
-5. add in graspnet
-6. add in dummy selection and moveit planning and execution
- 9. finalize this pipeline launch docs configs
-
-10. Add in intention analysis, aka hand tracking with egohos that publishes only when hand has stabilized
-10. add in proper selection node policy  
-11. add in proper grasping which doesnt move away unless there the hand let the weight go with fts
-12. run whole pipeline a lot
-13. design userstudy usecase with and without the selection criteria and the grasp sensing
-14. do user study
-```
-
-### GraspNet venv torch install command
-
-```bash
-/home/franka/projects/handovers_ws/src/graspnet_venv/bin/pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu130
-```
+### Debugging & Visualization
+- Use RViz2 to view the `segmentation_overlay` (EgoHOS output) and `grasp_debug_image` (GraspNet projection).
+- Monitor system state via: `ros2 topic echo /system_state`
+- Inspect grasp candidates via: `ros2 topic echo /grasp_candidates`

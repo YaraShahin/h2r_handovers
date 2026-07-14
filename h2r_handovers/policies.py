@@ -1,13 +1,4 @@
-"""Grasp selection policies.
-
-Each policy is a callable: (poses: list[Pose], frame_id: str) -> int | None
-It receives the list of candidate grasp poses (already sorted by GraspNet
-score descending) and returns the *index* of the chosen grasp, or None to
-reject every candidate (nothing is published for this capture).
-
-To add a new policy, define a function and register it in POLICIES.
-"""
-
+"""Grasp selection policies."""
 
 import numpy as np
 import rclpy
@@ -17,42 +8,25 @@ BASE_FRAME = 'panda_link0'
 
 
 def _log(logger, message, warn=False):
-    """Log via the node's ROS logger when provided (visible under launch and
-    in /rosout); falls back to print for bare/offline use.
-
-    info and warn go through separate calls: rclpy caches the severity per
-    source line, so one shared logger call raises 'Logger severity cannot
-    be changed between calls' as soon as both severities are used.
-    """
+    """Log via the node's ROS logger or print fallback."""
     if logger is None:
         print(message)
     elif warn:
-        logger.error(message)
+        logger.warning(message)
     else:
-        logger.error(message)
+        logger.info(message)
 
 
 def highest_score(poses, frame_id, tf_buffer=None, logger=None):
-    """Pick the top-scored grasp (index 0 — GraspNet sorts by score)."""
+    """Returns index 0, as GraspNet candidates are pre-sorted by score in descending order."""
     _log(logger, f'highest_score: selected candidate index 0 of {len(poses)} (top score).')
     return 0
 
 
 def top_down(poses, frame_id, tf_buffer=None, max_tilt_deg=45.0, strict=True,
              logger=None):
-    """Pick the best-scored grasp that approaches from above.
-
-    Walks the candidates in GraspNet-score order and returns the first whose
-    approach axis (pose Z) is within *max_tilt_deg* of straight down in the
-    robot base frame.
-
-    If none qualifies (or TF is unavailable, so tilt can't be checked):
-    - strict=True: all candidates are REJECTED — returns None, no grasp is
-      published and the orchestrator's capture simply times out.
-    - strict=False: falls back to the most downward-pointing candidate
-      (top-scored one on TF failure), so a sideways-only presentation still
-      yields a grasp.
-    """
+    """Selects the highest-scored grasp whose approach axis (Z) is within max_tilt_deg of straight down.
+    If strict=False, falls back to the most downward-pointing grasp if none qualify."""
     if tf_buffer is None:
         _log(logger, 'No TF buffer provided to top_down — '
              + ('rejecting all candidates!' if strict else 'falling back to top score.'),
@@ -95,11 +69,7 @@ def top_down(poses, frame_id, tf_buffer=None, max_tilt_deg=45.0, strict=True,
 
 
 def nearest_depth(poses, frame_id, tf_buffer=None, logger=None):
-    """Pick the grasp closest to the camera (smallest Z in camera frame).
-
-    Closer grasps tend to be more reachable and have better depth accuracy.
-    Only meaningful when poses are still in the camera optical frame.
-    """
+    """Pick grasp closest to the camera (smallest Z). Closer grasps are often more reachable/accurate."""
     idx = min(range(len(poses)), key=lambda i: poses[i].position.z)
     _log(logger, f'nearest_depth: selected candidate index {idx} of {len(poses)} '
          f'(depth {poses[idx].position.z:.3f} m).')
@@ -107,12 +77,7 @@ def nearest_depth(poses, frame_id, tf_buffer=None, logger=None):
 
 
 def top_k_aligned(poses, frame_id, tf_buffer=None, k=50, logger=None):
-    """Pick the grasp that requires the least wrist rotation.
-    
-    Looks at the top K grasps (which have the highest GraspNet scores)
-    and selects the one whose orientation requires the smallest rotational 
-    movement from the robot's current hand orientation.
-    """
+    """Pick grasp from top K that requires the least wrist rotation from current hand orientation."""
     limit = min(k, len(poses))
     
     if tf_buffer is None:
@@ -120,8 +85,7 @@ def top_k_aligned(poses, frame_id, tf_buffer=None, k=50, logger=None):
         return 0
 
     try:
-        # Lookup transform from hand to camera to get the camera's rotation in hand frame
-        # Use a timeout to prevent LookupException if the tree is slightly delayed
+        # Get camera's rotation in hand frame
         transform = tf_buffer.lookup_transform(
             'panda_hand', frame_id, rclpy.time.Time(), rclpy.duration.Duration(seconds=1.0)
         )
@@ -132,9 +96,7 @@ def top_k_aligned(poses, frame_id, tf_buffer=None, k=50, logger=None):
     
     def alignment_score(pose):
         q_g = pose.orientation
-        # Compute the scalar component (w) of the quaternion multiplication: 
-        # (q_cam * q_g) where q_cam is inverted. 
-        # This gives the cos(theta/2) of the angle between them.
+        # Cosine of half-angle between quaternions via w component of product with inverted q_cam.
         w = q_cam.w * q_g.w - q_cam.x * q_g.x - q_cam.y * q_g.y - q_cam.z * q_g.z
         return abs(w)
         
@@ -145,21 +107,9 @@ def top_k_aligned(poses, frame_id, tf_buffer=None, k=50, logger=None):
 
 
 def ergonomic(poses, frame_id, tf_buffer=None, hand_center=None, logger=None):
-    """Hybrid score / hand-clearance policy.
-
-    Selects two candidates:
-    1. the highest-scored grasp (index 0 — GraspNet sorts by score), and
-    2. the grasp with the largest clearance from the human hand centre
-       (*hand_center*, the 3-D hand centroid the GraspNet driver publishes
-       on 'hand_center' in the same camera frame as the candidates),
-    prints both together with the distance between them, and returns the
-    max-clearance grasp so the robot grips the end away from the human.
-
-    Falls back to highest_score when no hand centre is available for this
-    inference (hand not visible, or driver without the hand_center topic).
-    """
+    """Select grasp that maximizes distance from hand centroid for human comfort/safety."""
     if hand_center is None:
-        stri = 'ergonomic: no hand centre for this inference — ' + 'falling back to highest_score.'
+        stri = 'ergonomic: no hand centre for this inference, falling back to highest_score.'
         return highest_score(poses, frame_id, tf_buffer, logger=logger), stri
 
     positions = np.array([[p.position.x, p.position.y, p.position.z] for p in poses])
@@ -169,11 +119,14 @@ def ergonomic(poses, frame_id, tf_buffer=None, hand_center=None, logger=None):
     clearance_idx = int(np.argmax(clearances))
     separation = float(np.linalg.norm(positions[score_idx] - positions[clearance_idx]))
 
-    stri = f'ergonomic: highest-score grasp index {score_idx} ' + f'(hand clearance {clearances[score_idx]:.3f} m), ' + f'max-clearance grasp index {clearance_idx} of {len(poses)} ' +  f'(hand clearance {clearances[clearance_idx]:.3f} m), ' +  f'distance between the two grasps: {separation:.3f} m.'
+    stri = (
+        f'ergonomic: highest-score grasp index {score_idx} (hand clearance {clearances[score_idx]:.3f} m), '
+        f'max-clearance grasp index {clearance_idx} of {len(poses)} (hand clearance {clearances[clearance_idx]:.3f} m), '
+        f'distance between the two grasps: {separation:.3f} m.'
+    )
     return clearance_idx, stri
 
 
-# Map parameter strings to the corresponding policy functions
 POLICIES = {
     'highest_score': highest_score,
     'top_down': top_down,
